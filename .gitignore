@@ -12,3 +12,10 @@ tests/grpo_preflight_report.txt
 .DS_Store
 .vscode/
 .idea/
+
+# Generated strict shuffled-SID intervention data.
+# Rebuild deterministically with analysis/build_shuffled_sid_strict.py.
+analysis/shuffled_sid/
+
+# Generated consistency-audit info; formal eval uses the original info file.
+data/Amazon/info/*_shuffled.info.txt
