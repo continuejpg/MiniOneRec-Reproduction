@@ -62,6 +62,84 @@ Scaling Generative Recommendation**
 
 ---
 
+## 🔬 Reproduction & Engineering Notes
+
+> This section documents an independent engineering reproduction and training-pipeline audit of MiniOneRec on a single NVIDIA RTX 4090. The original MiniOneRec framework, method, and reported results belong to the upstream project.
+
+### Scope
+
+This reproduction focuses on the Amazon `Industrial_and_Scientific` setting and the SFT → GRPO recommendation pipeline. The goal is not to introduce a new recommendation algorithm, but to make the training/evaluation path more reliable, reproducible, and efficient on a single GPU.
+
+### Correctness and Reproducibility
+
+Several data/reward issues were audited and fixed:
+
+- Replaced prompt-text reward lookup with stable `sample_id -> target` binding.
+- Namespaced sequential sample IDs by source split and original dataframe row.
+- Unified the recommendation prompt used by SFT, RL, and offline evaluation.
+- Added fail-loud checks for missing, unknown, or colliding sample IDs.
+- Froze the GRPO training subset for controlled comparisons:
+  - `seq_rec`: 10,000
+  - title / description alignment: 6,516
+  - `seqtitle2sid`: 1,000
+  - total: **17,516**
+- Verified zero train/eval sample-ID overlap.
+
+CPU preflight regression suite: **15 / 15 checks passed**.
+
+### Controlled Evaluation
+
+All results below use the same test protocol:
+
+- Test samples: 4,533
+- Beam size: 20
+- Semantic-ID constrained decoding
+- Seed: 42
+- Metrics: HR@K / NDCG@K
+
+| Model | HR@1 | HR@5 | HR@10 | HR@20 | NDCG@20 |
+|---|---:|---:|---:|---:|---:|
+| Clean SFT | 6.927% | 12.111% | 15.376% | **19.832%** | **11.787%** |
+| GRPO 0.25 ep | 6.795% | 11.361% | 14.251% | 17.626% | 10.885% |
+| GRPO 1.5 ep | **7.059%** | 10.567% | 13.214% | 16.170% | 10.471% |
+| GRPO 2.0 ep | 7.037% | 10.435% | 12.972% | 16.236% | 10.447% |
+
+In this controlled reproduction, the upstream ranking-GRPO configuration slightly improves HR@1 at longer training stages but does not outperform the clean SFT baseline on broader Top-K recommendation quality.
+
+### GRPO Training-Efficiency Optimization
+
+Profiling showed that repeated full-validation evaluation and intermediate checkpointing dominated short-run wall-clock time.
+
+For a controlled 0.25-epoch comparison, the training algorithm, frozen dataset, reward, learning rate, KL coefficient, generation count, and epoch budget were kept fixed. The optimized run removes repeated during-training full-set evaluation and redundant intermediate checkpoint saves while retaining the same final offline evaluation protocol.
+
+| Setting | Train time | Throughput | Peak VRAM | HR@20 | NDCG@20 |
+|---|---:|---:|---:|---:|---:|
+| Original scheduling | 101.9 min | 0.717 step/s | 7.63 GB | 17.626% | 10.885% |
+| Optimized scheduling | **26.6 min** | **2.74 step/s** | 7.63 GB | 17.538% | 10.825% |
+
+Result:
+
+- **73.8% lower wall-clock training time**
+- **3.82× higher training throughput**
+- Essentially unchanged peak GPU memory
+- HR@20 / NDCG@20 changed by only -0.088 / -0.060 percentage points in this single-seed comparison
+
+Because rollout generation and the removed training-time evaluation are stochastic, identical optimization trajectories are not assumed.
+
+### Reproduction Utilities
+
+The engineering reproduction adds:
+
+- `patches/build_grpo_subsets.py` — generate frozen GRPO subsets
+- `patches/preflight_grpo.py` — CPU-only correctness regression checks
+- `patches/grpo_baseline.sh` — fixed 2-epoch GRPO benchmark
+- `patches/grpo_short025.sh` — original 0.25-epoch scheduling control
+- `patches/grpo_fast025.sh` — optimized 0.25-epoch efficiency run
+- `splits/` — frozen sample-ID subsets and manifest
+- `notes/experiment_summary.md` — detailed experiment record
+
+---
+
 ## 🗂️ Repository Overview
 
 | File / Directory          | Description                                                                                                   |

@@ -64,6 +64,11 @@ def train(
     cf_path: str = "",
     sid_index_path: str = "",
     item_meta_path: str = "",
+    subset_dir: str = "",
+    subset_seq: str = "grpo_seq_10k.json",
+    subset_seqtitle: str = "grpo_seqtitle_1k.json",
+    seqtitle_sample: int = 10000,
+    save_steps_frac: float = 0.1,
     dapo: bool = False,
     gspo: bool = False,
 ):
@@ -89,7 +94,7 @@ def train(
     train_datasets.append(train_data1)
     train_data2 = RLTitle2SidDataset(item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
     train_datasets.append(train_data2)
-    train_data3 = RLSeqTitle2SidDataset(train_file, category=category_dict[category], sample=10000)
+    train_data3 = RLSeqTitle2SidDataset(train_file, category=category_dict[category], sample=seqtitle_sample)
     train_datasets.append(train_data3)
     # train_data4 = RLSid2TitleDataset(item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
     # train_datasets.append(train_data4)
@@ -99,6 +104,48 @@ def train(
     # train_datasets.append(train_data6)
     # train_data7 = RLTitle2Sid_2LayerDataset(item_file=item_meta_path, index_file=sid_index_path, category=category_dict[category], sample=sample)
     # train_datasets.append(train_data7)
+    # ------------------------------------------------------------------
+    # FIXED SUBSETS: if subset_dir is given, freeze the training data by
+    # filtering each dataset down to a saved list of namespaced sample_ids.
+    # This makes "baseline" and "optimized" runs train on identical data.
+    # ------------------------------------------------------------------
+    if subset_dir:
+        def _load_ids(fname):
+            if not fname:
+                return None
+            p = fname if os.path.isabs(fname) else os.path.join(subset_dir, fname)
+            if not os.path.exists(p):
+                raise FileNotFoundError(f"subset file not found: {p}")
+            with open(p, "r", encoding="utf-8") as fh:
+                return set(json.load(fh)["sample_ids"])
+
+        _specs = [
+            (train_data1, "seq_rec", _load_ids(subset_seq)),
+            (train_data2, None, None),                      # RLTitle2SidDataset: always full
+            (train_data3, "seqtitle2sid", _load_ids(subset_seqtitle)),
+        ]
+        _filtered, _report = [], {}
+        for _ds, _task, _ids in _specs:
+            _name = _task or _ds.__class__.__name__
+            if _ids is None:
+                _filtered.append(_ds)
+                _report[_name] = len(_ds)
+                continue
+            _kept = [_x for _x in _ds if _x["sample_id"] in _ids]
+            _missing = len(_ids) - len(_kept)
+            _report[_name] = len(_kept)
+            if _missing:
+                print(f"[GRPO][subset] WARNING: task={_name} expected {len(_ids)} got {len(_kept)} "
+                      f"({_missing} ids not found in dataset)")
+            _filtered.append(_kept)
+        train_datasets = _filtered
+        print("=" * 70)
+        print(f"[GRPO][subset] subset_dir = {subset_dir}")
+        for _k, _v in _report.items():
+            print(f"[GRPO][subset]   {_k:14s}: {_v}")
+        print(f"[GRPO][subset]   TOTAL         : {sum(_report.values())}")
+        print("=" * 70)
+
     train_data = ConcatDataset(train_datasets)
     # eval_data = D3Dataset(eval_file, category=category_dict[category], sample=sample)
     eval_data = SidDataset(eval_file, category=category_dict[category], sample=sample)
@@ -114,21 +161,102 @@ def train(
     # prompt2history = {**train_data.prompt2history, **eval_data.prompt2history}
     # history2target = {**train_data.history2target, **eval_data.history2target}
 
-    prompt2history = {}
-    history2target = {}
-    
-    # Collect prompt2history and history2target from all train datasets
-    for dataset in train_datasets:
-        if hasattr(dataset, 'prompt2history'):
-            prompt2history.update(dataset.prompt2history)
-        if hasattr(dataset, 'history2target'):
-            history2target.update(dataset.history2target)
-    
-    # Add eval_data mappings
-    if hasattr(eval_data, 'prompt2history'):
-        prompt2history.update(eval_data.prompt2history)
-    if hasattr(eval_data, 'history2target'):
-        history2target.update(eval_data.history2target)
+
+    # ------------------------------------------------------------------
+    # Reward-target binding by STABLE sample_id (never prompt text).
+    # Built from every dataset that exposes id2target; namespaces
+    # (seq: / title: / seq_title:) guarantee no cross-dataset collision.
+    # ------------------------------------------------------------------
+    def build_id2target(datasets):
+        # Build bindings from the ACTUAL samples that enter training/eval.
+        # This also works after frozen-subset filtering turns a dataset into
+        # a plain Python list.
+        mapping, task_of = {}, {}
+
+        for ds in datasets:
+            local_mapping, local_task = {}, {}
+
+            for x in ds:
+                sid = x.get("sample_id")
+                target = x.get("completion")
+                task = x.get("task_type")
+
+                if sid is None:
+                    raise ValueError("sample without sample_id in reward binding")
+                if target is None:
+                    raise ValueError(f"sample_id {sid!r} has no completion/target")
+
+                if sid in local_mapping and local_mapping[sid] != target:
+                    raise ValueError(
+                        f"sample_id {sid!r} maps to multiple targets inside one dataset"
+                    )
+
+                local_mapping[sid] = target
+                if task is not None:
+                    local_task[sid] = task
+
+            overlap = set(local_mapping) & set(mapping)
+            if overlap:
+                raise ValueError(
+                    f"sample_id COLLISION across datasets: {len(overlap)} ids, "
+                    f"e.g. {sorted(overlap)[:5]}"
+                )
+
+            mapping.update(local_mapping)
+            task_of.update(local_task)
+
+        return mapping, task_of
+
+    id2target, id2task = build_id2target(train_datasets)
+    if hasattr(eval_data, "id2target"):
+        _ev, _evt = build_id2target([eval_data])
+        id2target.update(_ev)
+        id2task.update(_evt)
+
+    # id2history is only consumed by --reward_type sasrec (cf_reward). Built from each
+    # dataset's own prompt2history map, keyed by the SAME namespaced sample_id.
+    id2history = {}
+    for _ds in train_datasets:
+        _p2h = getattr(_ds, "prompt2history", None)
+        if not _p2h:
+            continue
+        for _x in _ds:
+            _sid = _x.get("sample_id")
+            if _sid is None:
+                continue
+            _h = _p2h.get(_x["prompt"])
+            if _h is not None:
+                id2history[_sid] = _h
+
+    print("=" * 70)
+    print(f"[GRPO] reward-target binding built")
+    print(f"[GRPO]   total bound sample_ids : {len(id2target)}")
+    print(f"[GRPO]   train samples          : {len(train_dataset)}")
+    print(f"[GRPO]   eval  samples          : {len(eval_dataset)}")
+    _task_counts = {}
+    for _t in id2task.values():
+        _task_counts[_t] = _task_counts.get(_t, 0) + 1
+    print(f"[GRPO]   task_type breakdown    : {_task_counts}")
+    print("=" * 70)
+
+
+    def _resolve_targets(sample_id, completions):
+        """Return the ground-truth target string for every completion."""
+        if sample_id is None:
+            raise ValueError(
+                "sample_id was not passed into the reward function. "
+                "The dataset must return 'sample_id' and the column must survive "
+                "into reward_kwargs. Refusing to fall back to prompt-text lookup."
+            )
+        targets = []
+        for sid in sample_id:
+            if sid not in id2target:
+                raise KeyError(
+                    f"sample_id {sid!r} has no bound target. "
+                    f"Bound ids: {len(id2target)}. This indicates a dataset/mapping mismatch."
+                )
+            targets.append(id2target[sid])
+        return targets
 
     print("train_dataset: ", train_dataset)
     print("eval_dataset: ", eval_dataset)
@@ -157,9 +285,9 @@ def train(
     ndcg_rewards = [-elm/sum(ndcg_rewards) for elm in ndcg_rewards]
 
 
-    def ndcg_rule_reward(prompts, completions):
-        history = [prompt2history[prompt] for prompt in prompts]
-        targets = [history2target[elm] for elm in history]
+
+    def ndcg_rule_reward(prompts, completions, sample_id=None, **kwargs):
+        targets = _resolve_targets(sample_id, completions)
         repeat = num_generations
         rewards = []
         flag = False
@@ -171,21 +299,20 @@ def train(
                 flag = True
                 lis.append(0.0)
             else:
-                lis.append(ndcg_rewards[i%num_generations])
-            
-            if (i+1)%num_generations == 0:
+                lis.append(ndcg_rewards[i % num_generations])
+
+            if (i + 1) % num_generations == 0:
                 if flag:
                     rewards.extend(lis)
                 else:
                     rewards.extend([0.0] * repeat)
                 flag = False
                 lis = []
-        
+
         return rewards
 
-    def rule_reward(prompts, completions):
-        history = [prompt2history[prompt] for prompt in prompts]
-        targets = [history2target[elm] for elm in history]
+    def rule_reward(prompts, completions, sample_id=None, **kwargs):
+        targets = _resolve_targets(sample_id, completions)
         rewards = []
 
         for i, completion in enumerate(completions):
@@ -196,9 +323,8 @@ def train(
                 rewards.append(0.0)
         return rewards
 
-    def semantic_reward(prompts, completions):
-        history = [prompt2history[prompt] for prompt in prompts]
-        targets = [history2target[elm] for elm in history]
+    def semantic_reward(prompts, completions, sample_id=None, **kwargs):
+        targets = _resolve_targets(sample_id, completions)
         target_ids = [item2id[elm.strip("\"\n")] for elm in targets]
         completions = [elm.strip("\"\n") for elm in completions]
         for i, completion in enumerate(completions):
@@ -212,9 +338,10 @@ def train(
         print(rewards)
         return rewards
 
-    def cf_reward(prompts, completions):
-        history = [prompt2history[prompt] for prompt in prompts]
-        history_list = [elm.split("::") for elm in history]
+    def cf_reward(prompts, completions, sample_id=None, **kwargs):
+        if sample_id is None:
+            raise ValueError("sample_id missing in cf_reward")
+        history_list = [id2history.get(sid, "").split("::") for sid in sample_id]
         pred_ids = []
         for i, elm in enumerate(completions):
             elm = elm.strip("\n\"")
@@ -261,8 +388,8 @@ def train(
     os.environ["WANDB_MODE"] = "offline"
 
     training_args = GRPOConfig(output_dir=output_dir,
-                                save_steps=0.1,
-                                save_total_limit=20,
+                                save_steps=save_steps_frac,
+                                save_total_limit=2,
                                 eval_strategy="steps",
                                 max_completion_length=128,
                                 num_generations=num_generations,
@@ -296,8 +423,6 @@ def train(
         test_during_training=test_during_training,
         test_beam=test_beam,
         info_file=info_file,
-        prompt2history=prompt2history,
-        history2target=history2target,
         reward_funcs=reward_fun,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

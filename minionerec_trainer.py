@@ -231,8 +231,6 @@ class ReReTrainer(Trainer):
         #* others
         info_file: str = None,
         # logits_processor: Optional[LogitsProcessor] = None,
-        prompt2history: dict[str, str] = None,
-        history2target: dict[str, str] = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
         processing_class: Optional[PreTrainedTokenizerBase] = None,
@@ -376,8 +374,6 @@ class ReReTrainer(Trainer):
             optimizers=optimizers,
         )
 
-        self.prompt2history = prompt2history
-        self.history2target = history2target
         self.add_gt = add_gt
         self.beam_search = beam_search
         self.info_file = info_file
@@ -667,10 +663,9 @@ class ReReTrainer(Trainer):
         prompts = [x["prompt"] for x in inputs]
 
         if self.add_gt or self.test_during_training or self.dynamic_sampling:
-            histories = [self.prompt2history[x["prompt"]] for x in inputs]
-            targets = [self.history2target[x] for x in histories]
-            # print(f"targets: {targets}")
-            num_categories = len(set(targets)) 
+            # Ground truth travels with each sample; avoid prompt-text lookup.
+            targets = [x["completion"] for x in inputs]
+            num_categories = len(set(targets))
         # target_ids = self.processing_class(targets, return_tensors="pt", padding=True, padding_side="left")["input_ids"]
         # target_ids = target_ids.to(device)
         
@@ -966,6 +961,57 @@ class ReReTrainer(Trainer):
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
 
+        # ---- zero-advantage diagnosis (group-level, BEFORE repeat_interleave) ----
+        # A group with near-zero reward variance produces near-zero
+        # group-relative advantages for all of its completions.
+        with torch.no_grad():
+            _zero_mask = std_grouped_rewards < 1e-6
+            self._metrics["zero_advantage_group_ratio"].append(
+                _zero_mask.float().mean().item()
+            )
+            self._metrics["num_groups"].append(
+                float(std_grouped_rewards.numel())
+            )
+            self._metrics["group_reward_std_mean"].append(
+                std_grouped_rewards.mean().item()
+            )
+
+            # task_type is attached to each sampled row. Under GRPO, rows for
+            # one prompt group are consecutive in chunks of num_generations.
+            _task_types = [ex.get("task_type") for ex in inputs]
+
+            if _task_types and all(x is not None for x in _task_types):
+                if len(_task_types) == rewards.numel():
+                    _group_task_types = _task_types[::self.num_generations]
+                elif len(_task_types) == std_grouped_rewards.numel():
+                    _group_task_types = _task_types
+                else:
+                    _group_task_types = None
+
+                # On the current single-GPU run this should match exactly.
+                # If a future distributed layout differs, skip per-task
+                # metrics rather than logging incorrect statistics.
+                if (
+                    _group_task_types is not None
+                    and len(_group_task_types) == std_grouped_rewards.numel()
+                ):
+                    for _ttname in sorted(set(_group_task_types)):
+                        _sel = torch.tensor(
+                            [x == _ttname for x in _group_task_types],
+                            device=device,
+                            dtype=torch.bool,
+                        )
+                        if not _sel.any():
+                            continue
+
+                        _sub_std = std_grouped_rewards[_sel]
+                        self._metrics[f"zero_adv_ratio/{_ttname}"].append(
+                            (_sub_std < 1e-6).float().mean().item()
+                        )
+                        self._metrics[f"num_groups/{_ttname}"].append(
+                            float(_sub_std.numel())
+                        )
+
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
@@ -1082,6 +1128,17 @@ class ReReTrainer(Trainer):
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics
+
+        # Running peak VRAM / wall-clock accounting (cheap engineering metrics).
+        try:
+            if torch.cuda.is_available():
+                _peak = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                metrics["peak_vram_gb"] = _peak
+                metrics["reserved_vram_gb"] = torch.cuda.max_memory_reserved() / (1024 ** 3)
+            if self.state.max_steps:
+                metrics["epoch_frac"] = round(self.state.global_step / self.state.max_steps, 4)
+        except Exception:
+            pass
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
         # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.

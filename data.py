@@ -34,6 +34,16 @@ class Tokenizer:
     def decode(self, t: List[int]) -> str:
         return self.tokenizer.decode(t)
 
+def build_recommendation_prompt(history_sid_str):
+    """Single source of truth for the next-item recommendation prompt.
+
+    Used by BOTH SidDataset (SFT + RL) and EvalSidDataset (offline evaluation)
+    so that SFT prompt == RL prompt == Eval prompt, character for character.
+    """
+    return ("The user has interacted with items " + history_sid_str +
+            " in chronological order. Can you predict the next possible item that the user may expect?")
+
+
 class BaseDataset(Dataset):
     def __init__(self, tokenizer=None, max_len=2048, test=False, category="", dedup=False, seed=None):
         super().__init__()
@@ -355,9 +365,17 @@ class SidDataset(CSVBaseDataset):
     def __init__(self, train_file, max_len=2048, sample=-1, seed=0, category="", dedup=False):
         super().__init__(train_file, sample, seed, max_len, category, dedup, tokenizer=None, test=False)
 
+        # Stable source namespace (e.g. train / valid / test).
+        # pandas.DataFrame.sample() preserves the original row index, so
+        # source_split + original row index is stable across subsampling.
+        _parts = str(train_file).replace("\\", "/").rstrip("/").split("/")
+        self.source_split = _parts[-2] if len(_parts) >= 2 else "data"
+
         self.prompt2history = {}
         self.history2target = {}
-        self.get_inputs()  
+        self.id2target = {}
+        self.id2task = {}
+        self.get_inputs()
 
     def get_history(self, row):
         row['history_item_sid'] = eval(row['history_item_sid'])
@@ -372,7 +390,7 @@ class SidDataset(CSVBaseDataset):
         target_item = str(row['item_sid'])
         target_item_sid = row["item_sid"]
         last_history_item_sid = row['history_item_sid'][-1] if row['history_item_sid'] else None
-        return {"input": f"The user has interacted with items {history} in chronological order. Can you predict the next possible item that the user may expect?",
+        return {"input": build_recommendation_prompt(history),
                 # Analyze user preferences and then predict the semantic ID of the next item.
                 "output": target_item + "\n",
                 "history_str": history_str,
@@ -386,11 +404,19 @@ class SidDataset(CSVBaseDataset):
         prompt = self.generate_prompt(history)
         self.prompt2history[prompt] = history["history_str"]
         self.history2target[history["history_str"]] = target_item
-        
+        # Stable identity: source split + ORIGINAL dataframe row index.
+        # DataFrame.sample() preserves the original row index, so this stays
+        # stable across sample=... settings and train/valid namespaces.
+        row_id = self.data.index[idx]
+        sid = f"seq:{self.source_split}:{row_id}"
+        self.id2target[sid] = target_item
+        self.id2task[sid] = "seq_rec"
+
         return {
             "prompt": prompt,
             "completion": target_item,
-
+            "sample_id": sid,
+            "task_type": "seq_rec",
         }
 
 
@@ -620,8 +646,7 @@ class EvalSidDataset(CSVBaseDataset):
         target_item = str(row['item_sid'])
         target_item_sid = row["item_sid"]
         last_history_item_sid = row['history_item_sid'][-1] if row['history_item_sid'] else None
-        return {"input": # f"The user has interacted with items {history} in chronological order. Can you predict the next possible item that the user may expect?",
-                f"Can you predict the next possible item the user may expect, given the following chronological interaction history: {history}",
+        return {"input": build_recommendation_prompt(history),
                 "output": target_item + '\n',
                 "dedup": target_item_sid == last_history_item_sid}
     
@@ -806,6 +831,8 @@ class RLTitle2SidDataset(JSONBaseDataset):
         
         self.prompt2history = {}
         self.history2target = {}
+        self.id2target = {}
+        self.id2task = {}
         
         # Build sid2title and sid2description mappings
         self.sid2title = {}
@@ -879,11 +906,15 @@ class RLTitle2SidDataset(JSONBaseDataset):
         
         self.prompt2history[prompt] = data_point['input']
         self.history2target[data_point['input']] = target_item
-        
+        sid = f"title:{idx}"
+        self.id2target[sid] = target_item
+        self.id2task[sid] = data_point['task']
+
         return {
             "prompt": prompt,
             "completion": target_item,
- 
+            "sample_id": sid,
+            "task_type": data_point['task'],
         }
 
 
@@ -904,6 +935,8 @@ class RLSeqTitle2SidDataset(CSVBaseDataset):
 
         self.prompt2history = {}
         self.history2target = {}
+        self.id2target = {}
+        self.id2task = {}
         
         self.get_inputs()
     
@@ -958,11 +991,15 @@ class RLSeqTitle2SidDataset(CSVBaseDataset):
         
         self.prompt2history[formatted_prompt] = history_data['history_str']
         self.history2target[history_data['history_str']] = target
-        
+        sid = f"seq_title:{idx}"
+        self.id2target[sid] = target
+        self.id2task[sid] = "seqtitle2sid"
+
         return {
             "prompt": formatted_prompt,
             "completion": target,
-
+            "sample_id": sid,
+            "task_type": "seqtitle2sid",
         }
 
 
