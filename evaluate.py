@@ -9,6 +9,7 @@ from data import  EvalD3Dataset, EvalSidDataset
 from LogitProcessor import ConstrainedLogitsProcessor
 from accelerate import Accelerator
 import random
+import time
 import bitsandbytes as bnb
 
 
@@ -48,6 +49,8 @@ def main(
     length_penalty: float=0.0,
     max_new_tokens: int = 256,
     num_beams: int = 50,
+    timing_callback=None,
+    warmup_batches: int = 0,
 ):
     random.seed(seed)
     set_seed(seed)
@@ -154,6 +157,7 @@ def main(
             num_beams=10,
             max_new_tokens=64,
             length_penalty=1.0,
+            on_generate=None,
             **kwargs,
     ):
         maxLen = max([len(_["input_ids"]) for _ in encodings])
@@ -188,6 +192,21 @@ def main(
             )
             logits_processor = LogitsProcessorList([clp])
 
+            # timing hook. on_generate is None for the formal path, so the
+            # measurement block below is skipped entirely and generate() is
+            # called with exactly the same arguments as before.
+            #
+            # Contract for a measured batch (on_generate is not None):
+            #   torch.cuda.synchronize()
+            #   t0 = time.perf_counter()
+            #   model.generate(...)
+            #   torch.cuda.synchronize()
+            #   elapsed = time.perf_counter() - t0
+            # Warmup batches pass on_generate=None, so they never reach here.
+            if on_generate is not None and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _t0 = time.perf_counter() if on_generate is not None else None
+
             generation_output = model.generate(
                 torch.tensor(padding_encodings["input_ids"]).to(device),
                 attention_mask=torch.tensor(attention_mask).to(device),
@@ -196,6 +215,11 @@ def main(
                 output_scores=True,
                 logits_processor=logits_processor,
             )
+
+            if on_generate is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                on_generate(len(encodings), (time.perf_counter() - _t0) * 1000.0)
        
         batched_completions = generation_output.sequences[:, maxLen:]
        
@@ -218,10 +242,31 @@ def main(
     for i in range(BLOCK):
         new_encodings.append(encodings[i * batch_size: (i + 1) * batch_size])
 
-    
+    # ------------------------------------------------------------------ warmup
+    # Runs the FIRST `warmup_batches` batches on the SAME already-loaded model
+    # instance and DISCARDS their predictions. Their outputs never enter
+    # `outputs`, and because they are invoked with on_generate=None they never
+    # reach the timing callback -- so warmup cannot contaminate latency,
+    # throughput or the prediction set. The formal measured pass below still
+    # traverses the FULL dataloader.
+    # warmup_batches=0 (the default) skips this block entirely: behaviour is
+    # identical to a version of this file without the block.
+    if warmup_batches and warmup_batches > 0:
+        n_warm = min(int(warmup_batches), len(new_encodings))
+        for idx in tqdm(range(n_warm), desc="warmup (discarded)"):
+            evaluate(new_encodings[idx],
+                     max_new_tokens=max_new_tokens,
+                     num_beams=num_beams,
+                     length_penalty=length_penalty,
+                     on_generate=None)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
     for idx, encodings in enumerate(tqdm(new_encodings)):
         # Use standard evaluation
-        output = evaluate(encodings, max_new_tokens=max_new_tokens, num_beams=num_beams, length_penalty=length_penalty)
+        output = evaluate(encodings, max_new_tokens=max_new_tokens, num_beams=num_beams, length_penalty=length_penalty, on_generate=timing_callback)
         
         outputs = outputs + output
        
