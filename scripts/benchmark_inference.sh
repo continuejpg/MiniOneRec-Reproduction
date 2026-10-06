@@ -75,34 +75,55 @@ else
     echo "  OK      output dir is free: $OUT"
 fi
 
-# benchmark must not touch the committed provenance
-if grep -q 'analysis/results' "$PROJECT_ROOT/analysis/benchmark_inference.py"; then
-    refuse "analysis/benchmark_inference.py references analysis/results/"
-else
-    echo "  OK      benchmark does not reference analysis/results/"
-fi
-
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     refuse "nvidia-smi not found -- no GPU on this host"
 fi
 
+# -----------------------------------------------------------------------------
+# Correctness / provenance gate -- delegated to the benchmark's own --preflight
+#
+# This used to be a bare `grep -q 'analysis/results'` over the benchmark source.
+# That was a false positive: the benchmark's preflight ASSERTS that it never
+# references analysis/results/, and the assertion text itself contains the
+# substring, so the grep matched the guard rather than a violation and the
+# committed launcher refused to run at all.
+#
+# It is NOT replaced by another string grep. The check now lives where it can be
+# done properly: analysis/benchmark_inference.py --preflight walks its own AST
+# and asserts, among 99 checks, that no string literal references
+# analysis/results/, that the protocol is not re-implemented, and that the
+# cutoff / timing / VRAM / alignment rules hold. The shell only requires that
+# this preflight exits 0 AND reports zero failures.
+# -----------------------------------------------------------------------------
+echo
+echo "--- benchmark static preflight (AST-based correctness gate) ---"
+preflight_log="$(mktemp)"
+"$PY" "$PROJECT_ROOT/analysis/benchmark_inference.py" --preflight 2>&1 | tee "$preflight_log"
+pf_rc=${PIPESTATUS[0]}
+echo
+if [ "$pf_rc" -ne 0 ]; then
+    echo "  REFUSE  benchmark --preflight exited $pf_rc (expected 0)"
+    fail=1
+elif ! grep -qE '^RESULT: [0-9]+ PASS, 0 FAIL' "$preflight_log"; then
+    echo "  REFUSE  benchmark --preflight did not report '0 FAIL'"
+    fail=1
+else
+    echo "  OK      benchmark --preflight: $(grep -E '^RESULT:' "$preflight_log")"
+fi
+rm -f "$preflight_log"
+
 if [ "$fail" -ne 0 ]; then
     echo "=== preflight FAILED -- not starting benchmark ==="
-    if [ "$PREFLIGHT_ONLY" = "1" ]; then
-        echo
-        echo "--- static checks only (no GPU required) ---"
-        "$PY" "$PROJECT_ROOT/analysis/benchmark_inference.py" --preflight
-        exit $?
-    fi
     exit 1
 fi
+echo
 echo "=== preflight OK ==="
 echo
 
 if [ "$PREFLIGHT_ONLY" = "1" ]; then
-    echo "PREFLIGHT_ONLY=1 -- running static checks and stopping."
-    "$PY" "$PROJECT_ROOT/analysis/benchmark_inference.py" --preflight
-    exit $?
+    # the preflight above has already run and its result is the exit condition
+    echo "PREFLIGHT_ONLY=1 -- static checks done, stopping before the benchmark."
+    exit 0
 fi
 
 # -----------------------------------------------------------------------------
