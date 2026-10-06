@@ -34,12 +34,15 @@ export WANDB_MODE=disabled
 export NCCL_IB_DISABLE=1
 export HF_ENDPOINT=https://hf-mirror.com
 
-D=/root/autodl-tmp
-cat=Industrial_and_Scientific
+# portable paths: PROJECT_ROOT / RUN_ROOT / DATA_ROOT / CATEGORY / PY
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
+
+# this stage needs the upstream Qwen2.5-0.5B weights -- deliberately no default
+: "${BASE_MODEL:?set BASE_MODEL to the Qwen2.5-0.5B model path}"
 
 # ---- original (clean) paths, kept for reference / the unchanged arguments ----
-ORIG_INDEX=$D/code/data/Amazon/index/${cat}.index.json
-ITEM_META=$D/code/data/Amazon/index/${cat}.item.json
+ORIG_INDEX="$INDEX"
 
 # ---- intervention (shuffled) paths -- the ONLY recipe difference -------------
 # NOTE on the index filename: TokenExtender (sft.py:31-39) does NOT open
@@ -49,13 +52,13 @@ ITEM_META=$D/code/data/Amazon/index/${cat}.item.json
 # "<Category>.index.json"). A file named "index.json" would give the stem "index"
 # and the rebuild would look for "index.index.json" and crash.
 # data.py opens --sid_index_path directly and is unaffected by the name.
-SHUF_DIR=$D/code/analysis/shuffled_sid
-SHUF_INDEX=$SHUF_DIR/${cat}.index.json
-SHUF_TRAIN=$SHUF_DIR/train.csv
-SHUF_VALID=$SHUF_DIR/valid.csv
+SHUF_DIR="$PROJECT_ROOT/analysis/shuffled_sid"
+SHUF_INDEX="$SHUF_DIR/${CATEGORY}.index.json"
+SHUF_TRAIN="$SHUF_DIR/train.csv"
+SHUF_VALID="$SHUF_DIR/valid.csv"
 
-OUT=$D/runs/industrial_sft_shuffled_sid
-CLEAN_RUN=$D/runs/industrial_sft
+OUT="$RUN_ROOT/industrial_sft_shuffled_sid"
+CLEAN_RUN="$RUN_ROOT/industrial_sft"
 
 # -----------------------------------------------------------------------------
 # Preflight: refuse to start if anything is off. No GPU work happens here.
@@ -65,12 +68,21 @@ fail=0
 check_exists() {
     if [ -e "$1" ]; then printf '  OK      %s\n' "$1"; else printf '  MISSING %s\n' "$1"; fail=1; fi
 }
-check_exists $D/models/Qwen2.5-0.5B
-check_exists $ITEM_META
-check_exists $SHUF_INDEX
-check_exists $SHUF_TRAIN
-check_exists $SHUF_VALID
-check_exists $D/code/sft.py
+check_exists "$BASE_MODEL"
+check_exists "$ITEM_META"
+check_exists "$SHUF_INDEX"
+check_exists "$SHUF_TRAIN"
+check_exists "$SHUF_VALID"
+check_exists "$PROJECT_ROOT/sft.py"
+
+# INDEX must keep the "<Category>.index.json" stem: TokenExtender rebuilds the
+# filename from `basename(--sid_index_path).split('.')[0]` (sft.py:31-39/152-153).
+if [ "$(basename "$INDEX")" = "${CATEGORY}.index.json" ]; then
+    echo "  OK      index basename is ${CATEGORY}.index.json"
+else
+    echo "  REFUSE  index basename is $(basename "$INDEX"), expected ${CATEGORY}.index.json"
+    fail=1
+fi
 
 # the clean run must exist (we are controlling against it) and must be untouched
 if [ -e "$CLEAN_RUN/final_checkpoint/model.safetensors" ]; then
@@ -128,17 +140,17 @@ echo
 # -----------------------------------------------------------------------------
 # Training -- IDENTICAL to sft_full.sh except the three swapped paths.
 # -----------------------------------------------------------------------------
-mkdir -p $OUT
+mkdir -p "$OUT"
 
 torchrun --nproc_per_node 1 \
     sft.py \
-    --base_model       $D/models/Qwen2.5-0.5B \
-    --train_file       $SHUF_TRAIN \
-    --eval_file        $SHUF_VALID \
-    --output_dir       $OUT \
-    --category         $cat \
-    --sid_index_path   $SHUF_INDEX \
-    --item_meta_path   $ITEM_META \
+    --base_model       "$BASE_MODEL" \
+    --train_file       "$SHUF_TRAIN" \
+    --eval_file        "$SHUF_VALID" \
+    --output_dir       "$OUT" \
+    --category         "$CATEGORY" \
+    --sid_index_path   "$SHUF_INDEX" \
+    --item_meta_path   "$ITEM_META" \
     --sample           -1 \
     --num_epochs       2 \
     --batch_size       64 \
@@ -148,4 +160,4 @@ torchrun --nproc_per_node 1 \
     --seed             42 \
     --train_from_scratch False \
     --freeze_LLM       False \
-    2>&1 | tee $OUT/train.log
+    2>&1 | tee "$OUT/train.log"

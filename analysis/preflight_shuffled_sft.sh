@@ -1,12 +1,23 @@
 #!/bin/bash
 # Static preflight for scripts/sft_shuffled_sid.sh -- NO GPU training is started.
-S=/root/autodl-tmp/code/scripts/sft_shuffled_sid.sh
-D=/root/autodl-tmp
-cat=Industrial_and_Scientific
+#
+# Paths come from scripts/common.sh (override PROJECT_ROOT / RUN_ROOT / DATA_ROOT
+# / BASE_MODEL from the environment). Every check that existed before is kept
+# unchanged; only the path SOURCE changed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../scripts/common.sh"
+
+S="$PROJECT_ROOT/scripts/sft_shuffled_sid.sh"
+SHUF_DIR_SELF="$PROJECT_ROOT/analysis/shuffled_sid"
 fail=0
 
 echo "=============================================================================="
 echo "STATIC PREFLIGHT: sft_shuffled_sid.sh   (no training is launched)"
+echo "  PROJECT_ROOT = $PROJECT_ROOT"
+echo "  DATA_ROOT    = $DATA_ROOT"
+echo "  RUN_ROOT     = $RUN_ROOT"
+echo "  CATEGORY     = $CATEGORY"
+echo "  INDEX        = $INDEX"
 echo "=============================================================================="
 
 echo
@@ -25,23 +36,22 @@ echo "--- 3. no CRLF, executable bit ---"
 echo
 echo "--- 4. every path the script references must exist ---"
 for p in \
-  $D/models/Qwen2.5-0.5B \
-  $D/code/sft.py \
-  $D/code/data/Amazon/index/${cat}.item.json \
-  $D/code/analysis/shuffled_sid/${cat}.index.json \
-  $D/code/analysis/shuffled_sid/train.csv \
-  $D/code/analysis/shuffled_sid/valid.csv \
-  $D/code/data/Amazon/index/${cat}.index.json
+  "$BASE_MODEL" \
+  "$PROJECT_ROOT/sft.py" \
+  "$ITEM_META" \
+  "$SHUF_DIR_SELF/${CATEGORY}.index.json" \
+  "$SHUF_DIR_SELF/train.csv" \
+  "$SHUF_DIR_SELF/valid.csv" \
+  "$INDEX"
 do
   if [ -e "$p" ]; then printf '  PASS  %s\n' "$p"; else printf '  FAIL  %s\n' "$p"; fail=1; fi
 done
 
 echo
 echo "--- 5. shuffled data readable + row counts + column check ---"
-/root/miniconda3/bin/python - <<'PY' || fail=1
+"$PY" - "$SHUF_DIR_SELF" "$CATEGORY" <<'PY' || fail=1
 import csv, json, os, sys
-SH = "/root/autodl-tmp/code/analysis/shuffled_sid"
-CAT = "Industrial_and_Scientific"
+SH, CAT = sys.argv[1], sys.argv[2]
 INDEX_NAME = f"{CAT}.index.json"
 ok = True
 
@@ -88,39 +98,57 @@ PY
 
 echo
 echo "--- 6. output_dir must not collide with an existing clean run ---"
-OUT=$D/runs/industrial_sft_shuffled_sid
+OUT="$RUN_ROOT/industrial_sft_shuffled_sid"
 if [ -e "$OUT/final_checkpoint/model.safetensors" ]; then
   echo "  FAIL  $OUT already holds a finished run"; fail=1
 else
   echo "  PASS  $OUT is free"
 fi
-if [ -e "$D/runs/industrial_sft/final_checkpoint/model.safetensors" ]; then
-  echo "  PASS  clean run intact: $D/runs/industrial_sft"
+if [ -e "$RUN_ROOT/industrial_sft/final_checkpoint/model.safetensors" ]; then
+  echo "  PASS  clean run intact: $RUN_ROOT/industrial_sft"
 else
   echo "  FAIL  clean run missing"; fail=1
 fi
 
 echo
 echo "--- 7. the only differing arguments vs sft_full.sh (after shell expansion) ---"
-/root/miniconda3/bin/python - <<'PY'
-import re
-D = "/root/autodl-tmp"
-cat = "Industrial_and_Scientific"
-# variables defined by each script
+"$PY" - "$PROJECT_ROOT" "$DATA_ROOT" "$RUN_ROOT" "$CATEGORY" <<'PY'
+import os, re, sys
+PROJECT_ROOT, DATA_ROOT, RUN_ROOT, CAT = sys.argv[1:5]
+BASE = f"{CAT}_5_2016-10-2018-11"
+SHUF = f"{PROJECT_ROOT}/analysis/shuffled_sid"
+# variables defined by scripts/common.sh and by each launcher
 ENV = {
-    "$D": D, "${cat}": cat, "${D}": D,
-    "$SHUF_DIR": f"{D}/code/analysis/shuffled_sid",
-    "$SHUF_INDEX": f"{D}/code/analysis/shuffled_sid/{cat}.index.json",
-    "$SHUF_TRAIN": f"{D}/code/analysis/shuffled_sid/train.csv",
-    "$SHUF_VALID": f"{D}/code/analysis/shuffled_sid/valid.csv",
-    "$ITEM_META": f"{D}/code/data/Amazon/index/{cat}.item.json",
-    "$OUT": f"{D}/runs/industrial_sft_shuffled_sid",
-    "$CLEAN_RUN": f"{D}/runs/industrial_sft",
+    "$PROJECT_ROOT": PROJECT_ROOT, "${PROJECT_ROOT}": PROJECT_ROOT,
+    "$DATA_ROOT": DATA_ROOT, "${DATA_ROOT}": DATA_ROOT,
+    "$RUN_ROOT": RUN_ROOT, "${RUN_ROOT}": RUN_ROOT,
+    "$CATEGORY": CAT, "${CATEGORY}": CAT, "${cat}": CAT,
+    "$BASE": BASE, "${BASE}": BASE,
+    "$TRAIN": f"{DATA_ROOT}/train/{BASE}.csv",
+    "$VALID": f"{DATA_ROOT}/valid/{BASE}.csv",
+    "$TEST": f"{DATA_ROOT}/test/{BASE}.csv",
+    "$INFO": f"{DATA_ROOT}/info/{BASE}.txt",
+    "$ITEM_META": f"{DATA_ROOT}/index/{CAT}.item.json",
+    "$INDEX": f"{DATA_ROOT}/index/{CAT}.index.json",
+    "$SPLITS": f"{PROJECT_ROOT}/splits",
+    "$BASE_MODEL": "${BASE_MODEL}",
+    "$SHUF_DIR": SHUF,
+    "$SHUF_INDEX": f"{SHUF}/{CAT}.index.json",
+    "$SHUF_TRAIN": f"{SHUF}/train.csv",
+    "$SHUF_VALID": f"{SHUF}/valid.csv",
+    "$OUT": f"{RUN_ROOT}/industrial_sft_shuffled_sid",
+    "$CLEAN_RUN": f"{RUN_ROOT}/industrial_sft",
+    "$SCRIPT_DIR/common.sh": f"{PROJECT_ROOT}/scripts/common.sh",
+    "$SCRIPT_DIR/../scripts/common.sh": f"{PROJECT_ROOT}/scripts/common.sh",
 }
 
 def expand(v):
-    for k in sorted(ENV, key=len, reverse=True):
-        v = v.replace(k, ENV[k])
+    for _ in range(6):
+        before = v
+        for k in sorted(ENV, key=len, reverse=True):
+            v = v.replace(k, ENV[k])
+        if v == before:
+            break
     return v
 
 def args(p):
@@ -130,8 +158,8 @@ def args(p):
     body = m.group(0) if m else t
     return {k: expand(v) for k, v in re.findall(r"--([a-z_]+)\s+(\S+)", body)}
 
-a = args(f"{D}/code/sft_full.sh")
-b = args(f"{D}/code/scripts/sft_shuffled_sid.sh")
+a = args(f"{PROJECT_ROOT}/sft_full.sh")
+b = args(f"{PROJECT_ROOT}/scripts/sft_shuffled_sid.sh")
 print(f"  {'argument':20s} {'same?':6s} clean")
 for k in sorted(set(a) | set(b)):
     va, vb = a.get(k, "(absent)"), b.get(k, "(absent)")

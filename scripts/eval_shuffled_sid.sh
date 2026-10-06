@@ -57,22 +57,22 @@ export HF_ENDPOINT=https://hf-mirror.com
 #            "shuffled" (audit only -- the trie is provably identical).
 INFO_MODE=${INFO_MODE:-original}
 
-D=/root/autodl-tmp
-cat=Industrial_and_Scientific
-BASE=${cat}_5_2016-10-2018-11
+# portable paths: PROJECT_ROOT / RUN_ROOT / DATA_ROOT / CATEGORY / PY
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/common.sh"
 
 # ---- clean (reference) paths ------------------------------------------------
-CLEAN_MODEL=$D/runs/industrial_sft/final_checkpoint
-CLEAN_OUT=$D/runs/eval_clean_sft
-CLEAN_INFO=$D/code/data/Amazon/info/${BASE}.txt
-CLEAN_TEST=$D/code/data/Amazon/test/${BASE}.csv
+CLEAN_MODEL="$RUN_ROOT/industrial_sft/final_checkpoint"
+CLEAN_OUT="$RUN_ROOT/eval_clean_sft"
+CLEAN_INFO="$INFO"
+CLEAN_TEST="$TEST"
 
 # ---- intervention paths -----------------------------------------------------
-SHUF_MODEL=$D/runs/industrial_sft_shuffled_sid/final_checkpoint
-SHUF_TEST=$D/code/analysis/shuffled_sid/test.csv
-SHUF_INFO=$D/code/data/Amazon/info/${cat}_shuffled.info.txt
-OUT=$D/runs/eval_shuffled_sid
-RESULT=$OUT/test_beam20.json
+SHUF_MODEL="$RUN_ROOT/industrial_sft_shuffled_sid/final_checkpoint"
+SHUF_TEST="$PROJECT_ROOT/analysis/shuffled_sid/test.csv"
+SHUF_INFO="$DATA_ROOT/info/${CATEGORY}_shuffled.info.txt"
+OUT="$RUN_ROOT/eval_shuffled_sid"
+RESULT="$OUT/test_beam20.json"
 
 # ---- which info file (see the header note) ----------------------------------
 case "$INFO_MODE" in
@@ -96,8 +96,8 @@ echo "=== preflight ==="
 fail=0
 chk() { if [ -e "$1" ]; then printf '  OK      %s\n' "$1"; else printf '  MISSING %s\n' "$1"; fail=1; fi; }
 
-chk "$D/code/evaluate.py"
-chk "$D/code/calc.py"
+chk "$PROJECT_ROOT/evaluate.py"
+chk "$PROJECT_ROOT/calc.py"
 chk "$SHUF_MODEL"
 chk "$SHUF_MODEL/config.json"
 chk "$SHUF_MODEL/model.safetensors"
@@ -119,7 +119,7 @@ if [ -e "$CLEAN_OUT/test_beam20.json" ]; then
     echo "  OK      clean eval intact: $CLEAN_OUT/test_beam20.json"
 fi
 
-python - "$CLEAN_INFO" "$SHUF_INFO" "$EVAL_INFO" "$SHUF_TEST" "$SHUF_MODEL" "$D/code/analysis/shuffled_sid/${cat}.index.json" <<'PY' || fail=1
+python - "$CLEAN_INFO" "$SHUF_INFO" "$EVAL_INFO" "$SHUF_TEST" "$SHUF_MODEL" "$PROJECT_ROOT/analysis/shuffled_sid/${CATEGORY}.index.json" <<'PY' || fail=1
 import json, re, sys
 clean_info, shuf_info, eval_info, shuf_test, model, shuf_index = sys.argv[1:7]
 SRE = re.compile(r"<[^<>]+>")
@@ -186,12 +186,12 @@ echo
 # -----------------------------------------------------------------------------
 # Step 1: generate predictions -- IDENTICAL protocol to the clean run
 # -----------------------------------------------------------------------------
-mkdir -p $OUT
+mkdir -p "$OUT"
 
-CUDA_VISIBLE_DEVICES=0 python -u ./evaluate.py \
+CUDA_VISIBLE_DEVICES=0 "$PY" -u "$PROJECT_ROOT/evaluate.py" \
     --base_model       "$SHUF_MODEL" \
     --info_file        "$EVAL_INFO" \
-    --category         "$cat" \
+    --category         "$CATEGORY" \
     --test_data_path   "$SHUF_TEST" \
     --result_json_data "$RESULT" \
     --batch_size       $BATCH_SIZE \
@@ -200,18 +200,18 @@ CUDA_VISIBLE_DEVICES=0 python -u ./evaluate.py \
     --length_penalty   $LENGTH_PENALTY \
     --max_new_tokens   $MAX_NEW_TOKENS \
     --num_beams        $NUM_BEAMS \
-    2>&1 | tee $OUT/evaluate.log
+    2>&1 | tee "$OUT/evaluate.log"
 
 # -----------------------------------------------------------------------------
 # Step 2: metrics -- ORIGINAL calc.py, unmodified
 # -----------------------------------------------------------------------------
 # item_path is used by calc.py only as a SID membership set; it must contain the
 # same SIDs the generator was allowed to emit, i.e. the same file passed above.
-python ./calc.py \
+"$PY" "$PROJECT_ROOT/calc.py" \
     --path      "$RESULT" \
     --item_path "$EVAL_INFO" \
-    2>&1 | tee $OUT/metrics.txt
+    2>&1 | tee "$OUT/metrics.txt"
 
 echo
 echo "=== done ==="
-cat $OUT/metrics.txt
+cat "$OUT/metrics.txt"

@@ -1,16 +1,27 @@
 #!/bin/bash
 # SASRec configuration sweep -- find a fairly-trained baseline, not a straw man.
-cd /root/autodl-tmp/code
-PY=/root/miniconda3/bin/python
-B=baselines/sasrec_baseline.py
-L=/root/autodl-tmp/runs/sasrec_sweep.log
+#
+# Paths come from scripts/common.sh (override PROJECT_ROOT / RUN_ROOT / PY from
+# the environment). The 4-config sweep below is intentionally unchanged.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../scripts/common.sh"
+
+cd "$PROJECT_ROOT"
+B="$PROJECT_ROOT/baselines/sasrec_baseline.py"
+L="$RUN_ROOT/sasrec_sweep.log"
+mkdir -p "$RUN_ROOT"
 : > "$L"
+
+"$PY" -c "import torch" 2>/dev/null || {
+  echo "REFUSE: '$PY' cannot import torch. Set PY to an interpreter that can." >&2
+  exit 1
+}
 
 run () {
   echo "" | tee -a "$L"
   echo "############################ $1 ############################" | tee -a "$L"
   shift
-  $PY -u $B "$@" 2>/dev/null | grep -vE "^\s*$" | tail -32 | tee -a "$L"
+  "$PY" -u "$B" "$@" 2>/dev/null | grep -vE "^\s*$" | tail -32 | tee -a "$L"
 }
 
 run "A: hidden=64  heads=1  full-softmax  100ep"  --tag a_h64_full    --hidden 64  --heads 1 --objective full --epochs 100

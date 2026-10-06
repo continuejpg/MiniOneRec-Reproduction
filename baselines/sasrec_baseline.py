@@ -15,7 +15,7 @@ the generative model is apples-to-apples:
       This is the ONLY protocol directly comparable to MiniOneRec's HR@20.
 
 Run on the server:
-    /root/miniconda3/bin/python sasrec_baseline.py
+    python sasrec_baseline.py
 """
 import ast
 import argparse
@@ -40,15 +40,22 @@ import torch.nn as nn
 from sasrec import SASRec
 
 # ----------------------------------------------------------------------------- config
-ROOT = "/root/autodl-tmp"
-DATA = f"{ROOT}/code/data/Amazon"
-CAT = "Industrial_and_Scientific"
+# Paths are derived from this file's location, not from a machine-specific prefix.
+# Override from the environment when the data or runs live elsewhere:
+#   PROJECT_ROOT  repo checkout      (default: parent dir of this file)
+#   DATA_ROOT     Amazon data root   (default: $PROJECT_ROOT/data/Amazon)
+#   RUN_ROOT      where runs/ live   (default: $PROJECT_ROOT/runs)
+#   CATEGORY      dataset category   (default: Industrial_and_Scientific)
+ROOT = os.environ.get("PROJECT_ROOT") or _REPO
+DATA = os.environ.get("DATA_ROOT") or os.path.join(ROOT, "data", "Amazon")
+RUN_ROOT = os.environ.get("RUN_ROOT") or os.path.join(ROOT, "runs")
+CAT = os.environ.get("CATEGORY") or "Industrial_and_Scientific"
 TRAIN = f"{DATA}/train/{CAT}_5_2016-10-2018-11.csv"
 VALID = f"{DATA}/valid/{CAT}_5_2016-10-2018-11.csv"
 TEST = f"{DATA}/test/{CAT}_5_2016-10-2018-11.csv"
 INDEX = f"{DATA}/index/{CAT}.index.json"
 
-OUT = f"{ROOT}/runs/sasrec_baseline"
+OUT = f"{RUN_ROOT}/sasrec_baseline"
 os.makedirs(OUT, exist_ok=True)
 
 DEFAULTS = dict(

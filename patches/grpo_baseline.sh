@@ -1,7 +1,7 @@
 #!/bin/bash
 # =====================================================================
 # grpo_baseline.sh -- fixed small-scale GRPO baseline.
-# Run on the AutoDL SERVER from /root/autodl-tmp/code, AFTER:
+# Run from the repository root (paths come from scripts/common.sh), AFTER:
 #   1) frozen subset files exist under splits/
 #   2) python patches/preflight_grpo.py passes
 #
@@ -19,10 +19,11 @@ export WANDB_MODE=disabled
 export NCCL_IB_DISABLE=1
 export HF_ENDPOINT=https://hf-mirror.com
 
-D=/root/autodl-tmp
-cat=Industrial_and_Scientific
-CKPT=$D/runs/industrial_sft/final_checkpoint
-OUT=$D/runs/grpo_baseline
+# portable paths: PROJECT_ROOT / RUN_ROOT / DATA_ROOT / CATEGORY / PY
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../scripts/common.sh"
+CKPT="$RUN_ROOT/industrial_sft/final_checkpoint"
+OUT="$RUN_ROOT/grpo_baseline"
 mkdir -p "$OUT"
 
 echo "=== GRPO baseline (fixed subsets) ==="
@@ -30,18 +31,18 @@ date -Is | tee "$OUT/started_at.txt"
 echo "policy/ref : $CKPT"
 echo "output     : $OUT"
 echo "disk before:"
-df -h /root/autodl-tmp | tail -1 | tee -a "$OUT/started_at.txt"
+df -h "$RUN_ROOT" | tail -1 | tee -a "$OUT/started_at.txt"
 
 nohup accelerate launch --num_processes 1 \
     rl.py \
     --model_path              "$CKPT" \
-    --train_file              "$D/code/data/Amazon/train/${cat}_5_2016-10-2018-11.csv" \
-    --eval_file               "$D/code/data/Amazon/valid/${cat}_5_2016-10-2018-11.csv" \
-    --info_file               "$D/code/data/Amazon/info/${cat}_5_2016-10-2018-11.txt" \
-    --category                "$cat" \
-    --sid_index_path          "$D/code/data/Amazon/index/${cat}.index.json" \
-    --item_meta_path          "$D/code/data/Amazon/index/${cat}.item.json" \
-    --subset_dir              "$D/code/splits" \
+    --train_file              "$TRAIN" \
+    --eval_file               "$VALID" \
+    --info_file               "$INFO" \
+    --category                "$CATEGORY" \
+    --sid_index_path          "$INDEX" \
+    --item_meta_path          "$ITEM_META" \
+    --subset_dir              "$SPLITS" \
     --subset_seq              grpo_seq_10k.json \
     --subset_seqtitle         grpo_seqtitle_1k.json \
     --output_dir              "$OUT" \

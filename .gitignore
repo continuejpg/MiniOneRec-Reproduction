@@ -19,3 +19,8 @@ analysis/shuffled_sid/
 
 # Generated consistency-audit info; formal eval uses the original info file.
 data/Amazon/info/*_shuffled.info.txt
+
+# Local environment overrides
+.env
+.env.*
+!.env.example

@@ -1,14 +1,26 @@
 #!/bin/bash
 # Static preflight for scripts/eval_shuffled_sid.sh -- NO GPU evaluation is started.
-S=/root/autodl-tmp/code/scripts/eval_shuffled_sid.sh
-D=/root/autodl-tmp
-cat=Industrial_and_Scientific
-BASE=${cat}_5_2016-10-2018-11
+#
+# Paths come from scripts/common.sh. Every check that existed before is kept
+# unchanged; only the path SOURCE changed.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../scripts/common.sh"
+
+S="$PROJECT_ROOT/scripts/eval_shuffled_sid.sh"
+SHUF_DIR_SELF="$PROJECT_ROOT/analysis/shuffled_sid"
+SHUF_MODEL="$RUN_ROOT/industrial_sft_shuffled_sid/final_checkpoint"
+SHUF_INFO="$DATA_ROOT/info/${CATEGORY}_shuffled.info.txt"
+EVAL_OUT="$RUN_ROOT/eval_shuffled_sid/test_beam20.json"
+CLEAN_EVAL_OUT="$RUN_ROOT/eval_clean_sft/test_beam20.json"
 fail=0
 note() { printf '  %-55s %s\n' "$1" "$2"; }
 
 echo "=============================================================================="
 echo "STATIC PREFLIGHT: eval_shuffled_sid.sh   (no evaluation is launched)"
+echo "  PROJECT_ROOT = $PROJECT_ROOT"
+echo "  DATA_ROOT    = $DATA_ROOT"
+echo "  RUN_ROOT     = $RUN_ROOT"
+echo "  CATEGORY     = $CATEGORY"
 echo "=============================================================================="
 
 echo
@@ -24,28 +36,28 @@ head -1 "$S" | grep -q '^#!/bin/bash' && note "shebang" "PASS" || { note "sheban
 echo
 echo "--- 3. required paths ---"
 for p in \
-  $D/code/evaluate.py \
-  $D/code/calc.py \
-  $D/code/LogitProcessor.py \
-  $D/runs/industrial_sft_shuffled_sid/final_checkpoint/config.json \
-  $D/runs/industrial_sft_shuffled_sid/final_checkpoint/model.safetensors \
-  $D/code/analysis/shuffled_sid/test.csv \
-  $D/code/analysis/shuffled_sid/${cat}.index.json \
-  $D/code/data/Amazon/info/${cat}_shuffled.info.txt \
-  $D/code/data/Amazon/info/${BASE}.txt \
-  $D/runs/eval_clean_sft/test_beam20.json
+  "$PROJECT_ROOT/evaluate.py" \
+  "$PROJECT_ROOT/calc.py" \
+  "$PROJECT_ROOT/LogitProcessor.py" \
+  "$SHUF_MODEL/config.json" \
+  "$SHUF_MODEL/model.safetensors" \
+  "$SHUF_DIR_SELF/test.csv" \
+  "$SHUF_DIR_SELF/${CATEGORY}.index.json" \
+  "$SHUF_INFO" \
+  "$INFO" \
+  "$CLEAN_EVAL_OUT"
 do
   if [ -e "$p" ]; then note "$p" "PASS"; else note "$p" "FAIL"; fail=1; fi
 done
 
 echo
 echo "--- 4. shuffled data properties ---"
-/root/miniconda3/bin/python - <<'PY' || fail=1
+"$PY" - "$PROJECT_ROOT" "$DATA_ROOT" "$RUN_ROOT" "$CATEGORY" <<'PY' || fail=1
 import csv, json, os, re, sys
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
+CODE, DATA_ROOT, RUN_ROOT, CAT = sys.argv[1:5]
 SH = CODE + "/analysis/shuffled_sid"
-MODEL = "/root/autodl-tmp/runs/industrial_sft_shuffled_sid/final_checkpoint"
+MODEL = RUN_ROOT + "/industrial_sft_shuffled_sid/final_checkpoint"
+BASE = CAT + "_5_2016-10-2018-11"
 SRE = re.compile(r"<[^<>]+>")
 ok = True
 
@@ -75,7 +87,7 @@ except Exception as e:
 def toks_from_index(p):
     d = json.load(open(p, encoding="utf-8"))
     return sorted({t for v in d.values() for t in (v if isinstance(v, list) else SRE.findall(v))})
-a = toks_from_index(CODE + "/data/Amazon/index/%s.index.json" % CAT)
+a = toks_from_index(DATA_ROOT + "/index/%s.index.json" % CAT)
 b = toks_from_index(SH + "/%s.index.json" % CAT)
 good = a == b
 print("  {:<55} {}".format("clean vs shuffled index SID tokens (%d)" % len(b),
@@ -83,8 +95,8 @@ print("  {:<55} {}".format("clean vs shuffled index SID tokens (%d)" % len(b),
 ok &= good
 
 # (d) info files: line count, token vocab, titles+ids verbatim
-ci = L(CODE + "/data/Amazon/info/%s_5_2016-10-2018-11.txt" % CAT)
-si = L(CODE + "/data/Amazon/info/%s_shuffled.info.txt" % CAT)
+ci = L(DATA_ROOT + "/info/%s.txt" % BASE)
+si = L(DATA_ROOT + "/info/%s_shuffled.info.txt" % CAT)
 good = len(ci) == len(si)
 print("  {:<55} {}".format("info line counts %d == %d" % (len(ci), len(si)),
                            "PASS" if good else "FAIL"))
@@ -130,12 +142,12 @@ PY
 
 echo
 echo "--- 5. output must not clobber the clean evaluation ---"
-if [ -e "$D/runs/eval_shuffled_sid/test_beam20.json" ]; then
-  note "$D/runs/eval_shuffled_sid/test_beam20.json exists" "REFUSE"; fail=1
+if [ -e "$EVAL_OUT" ]; then
+  note "$EVAL_OUT exists" "REFUSE"; fail=1
 else
-  note "$D/runs/eval_shuffled_sid/test_beam20.json is free" "PASS"
+  note "$EVAL_OUT is free" "PASS"
 fi
-if [ -e "$D/runs/eval_clean_sft/test_beam20.json" ]; then
+if [ -e "$CLEAN_EVAL_OUT" ]; then
   note "clean eval result present" "PASS"
 else
   note "clean eval result missing" "FAIL"; fail=1
@@ -143,9 +155,10 @@ fi
 
 echo
 echo "--- 6. parameter diff vs the clean protocol (only paths may differ) ---"
-/root/miniconda3/bin/python - <<'PY' || fail=1
-import re
-S = open("/root/autodl-tmp/code/scripts/eval_shuffled_sid.sh", encoding="utf-8").read()
+"$PY" - "$PROJECT_ROOT" <<'PY' || fail=1
+import re, sys
+PROJECT_ROOT = sys.argv[1]
+S = open(PROJECT_ROOT + "/scripts/eval_shuffled_sid.sh", encoding="utf-8").read()
 
 # protocol constants the script sets
 consts = dict(re.findall(r"^(BATCH_SIZE|NUM_BEAMS|MAX_NEW_TOKENS|LENGTH_PENALTY|SEED|K)=(\S+)$",
@@ -161,8 +174,13 @@ for k, v in EXPECT.items():
         okc = False
     print("    {:<16} = {:<6} expect {:<6} {}".format(k, got, v, tag))
 
-# the evaluate.py call must contain every flag with the right value
-call = re.search(r"python -u \./evaluate\.py(.*?)(?=\n\s*2>&1)", S, re.S).group(1)
+# the evaluate.py call: match the portable invocation
+#   CUDA_VISIBLE_DEVICES=0 "$PY" -u "$PROJECT_ROOT/evaluate.py"
+call = re.search(r'evaluate\.py"(.*?)(?=\n\s*2>&1)', S, re.S)
+if call is None:
+    print("  FAIL  could not locate the evaluate.py invocation")
+    sys.exit(1)
+call = call.group(1)
 # A value is either a double-quoted string or a bare token. Quotes are KEPT so the
 # comparison is exact. A bare token must not swallow the line-continuation
 # backslash that terminates every argument line, otherwise "$K \" is captured as
@@ -175,7 +193,7 @@ for k in sorted(flags):
 
 EXPECT_FLAGS = {"batch_size": "$BATCH_SIZE", "num_beams": "$NUM_BEAMS",
                 "max_new_tokens": "$MAX_NEW_TOKENS", "length_penalty": "$LENGTH_PENALTY",
-                "seed": "$SEED", "K": "$K", "category": '"$cat"'}
+                "seed": "$SEED", "K": "$K", "category": '"$CATEGORY"'}
 okf = True
 print("\n  protocol flags:")
 for k, v in EXPECT_FLAGS.items():
@@ -197,8 +215,8 @@ for k, v in EXPECT_INTERVENTION.items():
         oki = False
     print("    --{:<18} = {:<20} expect {:<20} {}".format(k, str(got), v, tag))
 
-# --info_file must now be routed through $EVAL_INFO, which defaults to the
-# ORIGINAL file (the trie depends on the SID codebook only; see the script header).
+# --info_file must be routed through $EVAL_INFO, which defaults to the ORIGINAL
+# file (the trie depends on the SID codebook only; see the script header).
 got = flags.get("info_file")
 good = got == '"$EVAL_INFO"'
 if not good:
@@ -223,7 +241,6 @@ okd = not extra
 print("\n  VERDICT: {}".format(
     "MATCH -- only model/data/output differ; --info_file stays the ORIGINAL"
     if (okc and okf and oki and okd) else "MISMATCH"))
-import sys
 sys.exit(0 if (okc and okf and oki and okd) else 1)
 PY
 
