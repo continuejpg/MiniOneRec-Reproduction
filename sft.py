@@ -113,6 +113,7 @@ def train(
     train_from_scratch: bool = False,
     sid_index_path: str = "",
     item_meta_path: str = "",
+    sft_mode: str = "full",  # "full" = upstream recipe | "seq_only" = SidSFTDataset only
 ):
     set_seed(seed)
     os.environ['WANDB_PROJECT'] = wandb_project
@@ -188,18 +189,36 @@ def train(
         print(f"Trainable parameters (with grad-mask): {trainable_params:,} / "
             f"{total_params:,} ({100*trainable_params/total_params:.2f}%)")
         
+    if sft_mode not in ("full", "seq_only"):
+        raise ValueError(
+            f"unknown sft_mode: {sft_mode!r} (expected 'full' or 'seq_only')"
+        )
+    print(f"SFT mode: {sft_mode}")
+
     train_datasets = []
     # train_data1 = SFTData(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
     train_data1 = SidSFTDataset(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
     train_datasets.append(train_data1)
-    train_data2 = SidItemFeatDataset(item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
-    train_datasets.append(train_data2)
-    train_data3 = FusionSeqRecDataset(train_file=train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len, sample=sample, seed=seed, category=category)
-    train_datasets.append(train_data3)
+    # The two component datasets below supply EXPLICIT TEXT supervision:
+    #   SidItemFeatDataset  -> title <-> SID alignment
+    #   FusionSeqRecDataset -> history SID -> target TITLE (sequence-conditioned text generation)
+    # They are skipped entirely (not constructed) in seq_only mode, so that the
+    # only objective left is the pure sequence task: history_item_sid -> item_sid.
+    # NOTE: this removes explicit text supervision. It does NOT remove all text
+    # information -- the semantic IDs themselves come from upstream text
+    # quantization by the RQ-VAE.
+    if sft_mode == "full":
+        train_data2 = SidItemFeatDataset(item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
+        train_datasets.append(train_data2)
+        train_data3 = FusionSeqRecDataset(train_file=train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len, sample=sample, seed=seed, category=category)
+        train_datasets.append(train_data3)
     # train_data4 = SFTData(train_file=train_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
     # train_datasets.append(train_data4)
     # train_data5 = TitleHistory2SidSFTDataset(train_file=train_file, item_file=item_meta_path, index_file=sid_index_path, tokenizer=tokenizer, max_len=cutoff_len, sample=sample, seed=seed, category=category)
     # train_datasets.append(train_data5)
+    print("train dataset components: "
+          + " + ".join(str(len(d)) for d in train_datasets)
+          + f" = {sum(len(d) for d in train_datasets)}")
     train_data = ConcatDataset(train_datasets)
     val_data = SidSFTDataset(train_file=eval_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=sample, seed=seed, category=category)
     # val_data = SFTData(train_file=eval_file, tokenizer=tokenizer, max_len=cutoff_len,  sample=20000, seed=seed, category=category)
