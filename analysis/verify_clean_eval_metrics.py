@@ -14,23 +14,25 @@ import os
 import sys
 from contextlib import redirect_stdout
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-PRED = "/root/autodl-tmp/runs/eval_clean_sft/test_beam20.json"
-INFO = f"{CODE}/data/Amazon/info/{CAT}_5_2016-10-2018-11.txt"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import CATEGORY, INFO, run, repo  # noqa: E402
+
+CAT = CATEGORY
+PRED = run("eval_clean_sft", "test_beam20.json")
+INFO = INFO
 
 TARGET_HR20 = 0.19832341
 TARGET_NDCG20 = 0.11786798
 
 # ---- import the real calc.py -------------------------------------------------
-spec = importlib.util.spec_from_file_location("calc_real", f"{CODE}/calc.py")
+spec = importlib.util.spec_from_file_location("calc_real", repo("calc.py"))
 calc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(calc)
 
 print("=" * 96)
 print("INDEPENDENT REPRODUCTION USING THE ACTUAL calc.py (imported, unmodified)")
 print("=" * 96)
-print(f"  calc.py      : {CODE}/calc.py")
+print(f"  calc.py      : {repo('calc.py')}")
 print(f"  predictions  : {PRED}")
 print(f"  item_path    : {INFO}")
 

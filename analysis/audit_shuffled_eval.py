@@ -12,9 +12,11 @@ Checks
   5. prediction legality, unique-SID count per sample, DuplicateRate@20
   6. clean-SFT vs shuffled-SID absolute and relative deltas
 
-No training, no evaluation, no GPU work. Writes
-analysis/results/shuffled_eval_provenance.json
+No training, no evaluation, no GPU work. By default it writes
+analysis/results/shuffled_eval_provenance.json; pass --check-only to run the
+identical checks without writing anything.
 """
+import argparse
 import importlib.util
 import io
 import json
@@ -22,18 +24,21 @@ import os
 import sys
 from contextlib import redirect_stdout
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-BASE = f"{CAT}_5_2016-10-2018-11"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import (  # noqa: E402
+    CATEGORY, INFO, INDEX, RESULTS_DIR,
+    SHUFFLED_INFO, SHUFFLED_TEST, repo, run,
+)
 
-SHUF_PRED = "/root/autodl-tmp/runs/eval_shuffled_sid/test_beam20.json"
-CLEAN_PRED = "/root/autodl-tmp/runs/eval_clean_sft/test_beam20.json"
-SHUF_INFO = f"{CODE}/analysis/shuffled_sid/{CAT}_shuffled.info.txt"
-CLEAN_INFO = f"{CODE}/data/Amazon/info/{BASE}.txt"
-SHUF_INDEX = f"{CODE}/analysis/shuffled_sid/{CAT}.index.json"
-ORIG_INDEX = f"{CODE}/data/Amazon/index/{CAT}.index.json"
-TEST_CSV = f"{CODE}/analysis/shuffled_sid/test.csv"
-OUT_JSON = f"{CODE}/analysis/results/shuffled_eval_provenance.json"
+CAT = CATEGORY
+SHUF_PRED = run("eval_shuffled_sid", "test_beam20.json")
+CLEAN_PRED = run("eval_clean_sft", "test_beam20.json")
+SHUF_INFO = SHUFFLED_INFO
+CLEAN_INFO = INFO
+SHUF_INDEX = os.path.join(os.path.dirname(SHUFFLED_TEST), f"{CATEGORY}.index.json")
+ORIG_INDEX = INDEX
+TEST_CSV = SHUFFLED_TEST
+OUT_JSON = os.path.join(RESULTS_DIR, "shuffled_eval_provenance.json")
 
 # recorded values the audit must reproduce
 EXPECT_NDCG = [0.06132804, 0.07315633, 0.07599527, 0.07921379, 0.08157358]
@@ -54,7 +59,7 @@ def check(name, ok, detail=""):
 
 def run_calc(pred_path, info_path):
     """Import the real calc.py and call gao(); parse the printed arrays."""
-    spec = importlib.util.spec_from_file_location("calc_real", f"{CODE}/calc.py")
+    spec = importlib.util.spec_from_file_location("calc_real", repo("calc.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     buf = io.StringIO()
@@ -70,9 +75,11 @@ def run_calc(pred_path, info_path):
     return hr, ndcg, out
 
 
-def main():
+def main(check_only=False):
     print("=" * 100)
     print("SHUFFLED-SID beam20 EVALUATION -- READ-ONLY PROVENANCE AUDIT")
+    if check_only:
+        print("MODE: --check-only (no file is written)")
     print("=" * 100)
 
     # ---------------------------------------------------------------- 1
@@ -239,6 +246,13 @@ def main():
         "summary": {"checks": len(results["checks"]), "failed": n_fail,
                     "problems": len(results["problems"])},
     })
+    if check_only:
+        print("\n" + "=" * 100)
+        print(f"AUDIT: {len(results['checks'])-n_fail}/{len(results['checks'])} PASS, {n_fail} FAIL")
+        print("[check-only] nothing written")
+        print("=" * 100)
+        return 1 if n_fail else 0
+
     with open(OUT_JSON, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
 
@@ -250,4 +264,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--check-only", action="store_true",
+                    help="run the identical checks but write no file")
+    args = ap.parse_args()
+    sys.exit(main(check_only=args.check_only))

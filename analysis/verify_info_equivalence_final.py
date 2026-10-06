@@ -22,13 +22,14 @@ import re
 import sys
 from collections import Counter
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-BASE = f"{CAT}_5_2016-10-2018-11"
-CLEAN_INFO = f"{CODE}/data/Amazon/info/{BASE}.txt"
-SHUF_INFO = f"{CODE}/data/Amazon/info/{CAT}_shuffled.info.txt"
-CLEAN_MODEL = "/root/autodl-tmp/runs/industrial_sft/final_checkpoint"
-SHUF_MODEL = "/root/autodl-tmp/runs/industrial_sft_shuffled_sid/final_checkpoint"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import CATEGORY, INFO, SHUFFLED_INFO, repo, run  # noqa: E402
+
+CAT = CATEGORY
+CLEAN_INFO = INFO
+SHUF_INFO = SHUFFLED_INFO
+CLEAN_MODEL = run("industrial_sft", "final_checkpoint")
+SHUF_MODEL = run("industrial_sft_shuffled_sid", "final_checkpoint")
 
 
 def get_hash(x):
@@ -72,7 +73,7 @@ def main():
     print("\n" + "=" * 96)
     print("A. info_file ROLE -- static check of evaluate.py")
     print("=" * 96)
-    src = open(f"{CODE}/evaluate.py", encoding="utf-8").read()
+    src = open(repo("evaluate.py"), encoding="utf-8").read()
     n_ref = len(re.findall(r"\binfo_file\b", src))
     fields = sorted(set(re.findall(r"split\('\\t'\)\[(\d)\]", src)))
     print(f"  occurrences of the token 'info_file' in evaluate.py : {n_ref}")
@@ -81,7 +82,7 @@ def main():
     print(f"  -> item_id (field 2) read anywhere?                 : {'2' in fields}")
     print(f"  -> 'index_file' / 'indices' used in evaluate.py?    : "
           f"{('index_file' in src) or ('indices' in src)}")
-    ds = open(f"{CODE}/data.py", encoding="utf-8").read()
+    ds = open(repo("data.py"), encoding="utf-8").read()
     ev = re.search(r"class EvalSidDataset.*?(?=\nclass )", ds, re.S).group(0)
     print(f"  EvalSidDataset refs info_file/item_file/index_file  : "
           f"{[t for t in ('info_file','item_file','index_file','indices') if t in ev]}")

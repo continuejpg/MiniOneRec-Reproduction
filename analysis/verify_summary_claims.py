@@ -16,17 +16,18 @@ import os
 import sys
 from contextlib import redirect_stdout
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-BASE = f"{CAT}_5_2016-10-2018-11"
-RUNS = "/root/autodl-tmp/runs"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import CATEGORY, INFO, RUN_ROOT, SHUFFLED_DIR, SHUFFLED_TEST, TEST, repo, run  # noqa: E402
 
-CLEAN_PRED = f"{RUNS}/eval_clean_sft/test_beam20.json"
-SHUF_PRED = f"{RUNS}/eval_shuffled_sid/test_beam20.json"
-CLEAN_TEST = f"{CODE}/data/Amazon/test/{BASE}.csv"
-SHUF_TEST = f"{CODE}/analysis/shuffled_sid/test.csv"
-MAPPING = f"{CODE}/analysis/shuffled_sid/mapping.json"
-CLEAN_INFO = f"{CODE}/data/Amazon/info/{BASE}.txt"
+CAT = CATEGORY
+RUNS = RUN_ROOT
+
+CLEAN_PRED = run("eval_clean_sft", "test_beam20.json")
+SHUF_PRED = run("eval_shuffled_sid", "test_beam20.json")
+CLEAN_TEST = TEST
+SHUF_TEST = SHUFFLED_TEST
+MAPPING = os.path.join(SHUFFLED_DIR, "mapping.json")
+CLEAN_INFO = INFO
 
 print("=" * 100)
 print("V1/V2. ARE THE UNCHANGED ROWS THE FROZEN COLLISION ITEMS?")
@@ -87,7 +88,7 @@ print("\n" + "=" * 100)
 print("V3. MACHINE CHECK OF EVERY HEADLINE METRIC AGAINST ITS ARTIFACT")
 print("=" * 100)
 
-spec = importlib.util.spec_from_file_location("calc_real", f"{CODE}/calc.py")
+spec = importlib.util.spec_from_file_location("calc_real", repo("calc.py"))
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
 

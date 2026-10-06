@@ -19,18 +19,20 @@ reported so any difference is visible rather than hidden.
 Read-only. Runs no generation, no GPU work beyond loading a tokenizer.
 """
 import json
+import os
 import re
 import sys
 from collections import Counter
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-BASE = f"{CAT}_5_2016-10-2018-11"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import CATEGORY, INFO, SHUFFLED_INFO, repo, run  # noqa: E402
 
-CLEAN_INFO = f"{CODE}/data/Amazon/info/{BASE}.txt"
-SHUF_INFO = f"{CODE}/data/Amazon/info/{CAT}_shuffled.info.txt"
-CLEAN_MODEL = "/root/autodl-tmp/runs/industrial_sft/final_checkpoint"
-SHUF_MODEL = "/root/autodl-tmp/runs/industrial_sft_shuffled_sid/final_checkpoint"
+CAT = CATEGORY
+
+CLEAN_INFO = INFO
+SHUF_INFO = SHUFFLED_INFO
+CLEAN_MODEL = run("industrial_sft", "final_checkpoint")
+SHUF_MODEL = run("industrial_sft_shuffled_sid", "final_checkpoint")
 
 
 # ---- exact copies from evaluate.py (lines 24-26, 61-119, 122-126) ------------
@@ -224,7 +226,7 @@ def main():
     print("\n" + "-" * 104)
     print("6. does anything read field 3 (item_id) of the info file?")
     print("-" * 104)
-    src = open(f"{CODE}/evaluate.py", encoding="utf-8").read()
+    src = open(repo("evaluate.py"), encoding="utf-8").read()
     uses = re.findall(r"split\('\\t'\)\[(\d)\]", src)
     print(f"  evaluate.py accesses tab-field indices: {sorted(set(uses))}")
     print(f"  -> field 0 = SID (used), field 1 = title (built, never consumed), "

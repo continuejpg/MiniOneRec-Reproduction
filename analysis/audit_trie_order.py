@@ -17,12 +17,13 @@ import re
 import sys
 from collections import Counter
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-BASE = f"{CAT}_5_2016-10-2018-11"
-CLEAN_INFO = f"{CODE}/data/Amazon/info/{BASE}.txt"
-SHUF_INFO = f"{CODE}/data/Amazon/info/{CAT}_shuffled.info.txt"
-CLEAN_MODEL = "/root/autodl-tmp/runs/industrial_sft/final_checkpoint"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import CATEGORY, INFO, SHUFFLED_INFO, repo, run  # noqa: E402
+
+CAT = CATEGORY
+CLEAN_INFO = INFO
+SHUF_INFO = SHUFFLED_INFO
+CLEAN_MODEL = run("industrial_sft", "final_checkpoint")
 
 
 def get_hash(x):
@@ -84,7 +85,7 @@ def main():
 
     # ---------------- T3: prove order is irrelevant ------------------------
     print("\nT3. is list order semantically relevant? (LogitProcessor.py:68)")
-    src = open(f"{CODE}/LogitProcessor.py", encoding="utf-8").read()
+    src = open(repo("LogitProcessor.py"), encoding="utf-8").read()
     line = [l.strip() for l in src.splitlines() if "prefix_allowed_tokens]" in l]
     print(f"   usage: {line}")
     print("   -> advanced-index assignment; the result depends only on the SET of")

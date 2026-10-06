@@ -31,15 +31,26 @@ import os
 import sys
 from collections import Counter
 
-CODE = "/root/autodl-tmp/code"
-CAT = "Industrial_and_Scientific"
-BASE = f"{CAT}_5_2016-10-2018-11"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import (  # noqa: E402
+    CATEGORY, INDEX, INFO, SHUFFLED_DIR, SHUFFLED_INFO,
+)
 
-SRC_INFO = f"{CODE}/data/Amazon/info/{BASE}.txt"
-SHUF_INDEX = f"{CODE}/analysis/shuffled_sid/{CAT}.index.json"
-ORIG_INDEX = f"{CODE}/data/Amazon/index/{CAT}.index.json"
-OUT_SHUF = f"{CODE}/analysis/shuffled_sid/{CAT}_shuffled.info.txt"
-OUT_MIRROR = f"{CODE}/data/Amazon/info/{CAT}_shuffled.info.txt"
+CAT = CATEGORY
+
+SRC_INFO = INFO
+SHUF_INDEX = os.path.join(SHUFFLED_DIR, f"{CATEGORY}.index.json")
+ORIG_INDEX = INDEX
+
+# Authoritative output location: the data tree, matching
+# scripts/eval_shuffled_sid.sh and .gitignore.
+OUT_SHUF = SHUFFLED_INFO
+
+# Legacy location from an earlier run. The file recorded in
+# analysis/results/*.json lives at OUT_SHUF; this path is only cross-checked
+# when it happens to exist, and is never the primary write target.
+OUT_LEGACY = os.path.join(SHUFFLED_DIR, f"{CATEGORY}_shuffled.info.txt")
+OUT_MIRROR = OUT_SHUF
 
 
 def main():
@@ -79,11 +90,18 @@ def main():
         out_lines.append(f"{new_sid}\t{title}\t{item_id}")
 
     payload = "\r\n".join(out_lines) + "\r\n"
-    for path in (OUT_SHUF, OUT_MIRROR):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="") as f:
-            f.write(payload)
-        print(f"[out] {path}  ({os.path.getsize(path):,} bytes)")
+    os.makedirs(os.path.dirname(OUT_SHUF), exist_ok=True)
+    with open(OUT_SHUF, "w", encoding="utf-8", newline="") as f:
+        f.write(payload)
+    print(f"[out] {OUT_SHUF}  ({os.path.getsize(OUT_SHUF):,} bytes)")
+
+    # a stale copy from an earlier run must agree; if it disagrees, say so loudly
+    if os.path.exists(OUT_LEGACY) and os.path.abspath(OUT_LEGACY) != os.path.abspath(OUT_SHUF):
+        same_legacy = open(OUT_LEGACY, "rb").read() == open(OUT_SHUF, "rb").read()
+        print(f"[legacy] {OUT_LEGACY}  identical={same_legacy}")
+        if not same_legacy:
+            print("[legacy] WARNING: stale copy differs from the authoritative file; "
+                  "delete it or re-run to refresh")
 
     # ------------------------------------------------------------------ checks
     print(f"\n[check] lines written          = {len(out_lines)}  (expect {len(lines)})")

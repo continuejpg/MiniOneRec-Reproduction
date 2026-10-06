@@ -41,17 +41,19 @@ import sys
 from collections import Counter, defaultdict
 from itertools import combinations
 
-CODE = "/root/autodl-tmp/code"
-DATA = f"{CODE}/data/Amazon"
-CAT = "Industrial_and_Scientific"
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _paths import CATEGORY, DATA_ROOT, SHUFFLED_DIR, RESULTS_DIR  # noqa: E402
+
+DATA = DATA_ROOT
+CAT = CATEGORY
 
 TRAIN = f"{DATA}/train/{CAT}_5_2016-10-2018-11.csv"
 VALID = f"{DATA}/valid/{CAT}_5_2016-10-2018-11.csv"
 TEST = f"{DATA}/test/{CAT}_5_2016-10-2018-11.csv"
 INDEX = f"{DATA}/index/{CAT}.index.json"
 
-OUT_DIR = f"{CODE}/analysis/shuffled_sid"        # same dir, regenerated
-RES_DIR = f"{CODE}/analysis/results"
+OUT_DIR = SHUFFLED_DIR        # same dir, regenerated
+RES_DIR = RESULTS_DIR
 SEED = 42
 
 # TokenExtender (sft.py:31-39) does NOT use the path you pass to --sid_index_path
