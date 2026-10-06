@@ -91,10 +91,31 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# --------------------------------------------------------------------------- #
+# import paths
+#
+# The benchmark lives in <repo>/analysis/ but the protocol it drives lives in
+# <repo>/evaluate.py. Both directories must be importable, and neither may
+# depend on the shell's cwd:
+#
+#   <repo>/analysis  -> `import _paths`               (this file's own dir)
+#   <repo>           -> `import evaluate as EV`       (the protocol under test)
+#
+# The repo root is derived from _paths.PROJECT_ROOT, which is itself computed
+# from this file's __file__ (and honours a PROJECT_ROOT env override), so
+# `python /any/cwd/.../analysis/benchmark_inference.py` works unchanged and no
+# absolute server path is ever hard-coded.
+# --------------------------------------------------------------------------- #
+_ANALYSIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ANALYSIS_DIR not in sys.path:
+    sys.path.insert(0, _ANALYSIS_DIR)
+
 from _paths import (  # noqa: E402
     CATEGORY, INFO, PROJECT_ROOT, RUN_ROOT, TEST, repo, run,
 )
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # --------------------------------------------------------------------------- #
 # formal protocol constants -- identical to scripts/eval_seq_only_clean.sh
@@ -155,6 +176,45 @@ SEMANTICS = {
     "warmup": (f"the first {BENCH_WARMUP_BATCHES} batches inside the single "
                "evaluate.main() call, executed with timing_callback=None and discarded"),
 }
+
+# --------------------------------------------------------------------------- #
+# protocol import -- the single place `evaluate` is imported
+# --------------------------------------------------------------------------- #
+
+
+def import_evaluate():
+    """Import the protocol under test using the benchmark's OWN sys.path.
+
+    Returns (module, error_string). Exactly one of the two is None.
+
+    Why this exists as a function
+    -----------------------------
+    A previous revision imported evaluate only inside run_once() via a bare
+    `import evaluate as EV`. That failed at runtime with
+    `ModuleNotFoundError: No module named 'evaluate'`, because <repo> was not on
+    sys.path -- while --preflight still reported 99 PASS, since its only check
+    was a source-text assertion that the line existed. The preflight never
+    actually imported anything.
+
+    Both --preflight and run_once now go through this function, so the check
+    cannot drift from the real import path. Importing evaluate.py has no side
+    effects: it defines helpers and main() and never loads a model, touches
+    CUDA or generates anything.
+
+    sys.modules is cleared first so that the import is genuinely re-evaluated
+    against the CURRENT sys.path rather than served from a cached module.
+    """
+    import importlib
+
+    sys.modules.pop("evaluate", None)
+    try:
+        mod = importlib.import_module("evaluate")
+    except BaseException as e:                    # noqa: BLE001 - report anything
+        return None, f"{type(e).__name__}: {e}"
+    if not callable(getattr(mod, "main", None)):
+        return None, "module 'evaluate' has no callable main()"
+    return mod, None
+
 
 # --------------------------------------------------------------------------- #
 # static rules (pure functions -- also exercised by --preflight)
@@ -389,7 +449,10 @@ def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=T
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available -- refusing to benchmark on CPU")
 
-    import evaluate as EV
+    # the protocol under test, resolved through the same helper --preflight uses
+    EV, err = import_evaluate()
+    if EV is None:
+        raise RuntimeError(f"cannot import evaluate from the benchmark context: {err}")
 
     run_dir = os.path.join(out_root, tag)
     pred_path = os.path.join(run_dir, "test_beam%d.json" % beam)
@@ -802,6 +865,8 @@ def preflight():
     chk("main" in call_names and "EV.main(" in src,
         "the benchmark calls evaluate.main() directly (single protocol)")
     chk("import evaluate as EV" in src, "evaluate is imported, not copied")
+    chk("import_evaluate()" in src and "EV, err = import_evaluate()" in src,
+        "run_once() resolves evaluate through import_evaluate(), not a bare import")
     chk("num_beams=beam" in src and "batch_size=batch_size" in src,
         "all protocol knobs are forwarded through evaluate.main()'s own parameters")
     ev_main = next((n for n in ast.walk(ast.parse(ev_src))
@@ -828,6 +893,29 @@ def preflight():
     chk(not os.path.exists(OUT_DIR),
         "benchmark output dir does not exist yet (will not overwrite)", OUT_DIR)
     chk("exist_ok=False" in src, "per-configuration dir is created fail-loud")
+
+    # ---- 11b. RUNTIME import of the protocol under test --------------------
+    # Not a text assertion this time: this actually imports evaluate.py through
+    # the benchmark's own configured sys.path. It cannot pass by accident from a
+    # convenient cwd, because the path entry it relies on is the one set up at
+    # the top of THIS file. evaluate.py only defines helpers and main() at import
+    # time -- no model is loaded, no CUDA call is made, nothing is generated.
+    chk(PROJECT_ROOT in sys.path, "repo root is on sys.path (protocol importable)",
+        PROJECT_ROOT)
+    chk(_ANALYSIS_DIR in sys.path, "analysis/ (own dir) is on sys.path", _ANALYSIS_DIR)
+    ev_mod, ev_err = import_evaluate()
+    chk(ev_mod is not None,
+        "runtime import evaluate succeeds from benchmark execution context",
+        "imported from " + str(getattr(ev_mod, "__file__", "?")) if ev_mod
+        else f"FAILED: {ev_err}")
+    chk(ev_mod is not None and os.path.abspath(ev_mod.__file__) ==
+        os.path.abspath(repo("evaluate.py")),
+        "the imported evaluate is the repository's own evaluate.py",
+        os.path.abspath(repo("evaluate.py")))
+    chk(ev_mod is not None and callable(getattr(ev_mod, "main", None)),
+        "imported evaluate exposes a callable main()")
+    chk(ev_mod is None or not hasattr(ev_mod, "__version__"),
+        "importing evaluate loads no model (no version attribute)")
 
     # ---- 12. recorded measurement semantics --------------------------------
     for key in ("latency_p50_ms", "request_latency_p50_ms", "generation_seconds",
