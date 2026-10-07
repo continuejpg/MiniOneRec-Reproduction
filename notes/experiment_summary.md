@@ -1014,3 +1014,267 @@ Hashes recorded inside that archive:
   (**0** for the formal runs). The inner helper's `length_penalty=1.0` default is dead:
   the call site always passes the value explicitly.
 - **`checkpoint-4379` is 0.25 epoch**, and `checkpoint-26274` is 1.5 epoch. See §6.1.
+
+---
+
+## 20. Qwen2.5-1.5B Backbone Scaling Sanity Check
+
+The complete Clean vs. strict shuffled-SID protocol was repeated on a larger backbone in the
+same family. 0.5B remains the project's main experimental backbone; 1.5B is a scaling
+extension, not a second full replication.
+
+### 20.1 Stage-A compatibility
+
+| | 0.5B | 1.5B |
+|---|---|---|
+| model ID | `Qwen/Qwen2.5-0.5B` | `Qwen/Qwen2.5-1.5B` |
+| variant | base (not `-Instruct`) | base (not `-Instruct`) |
+| revision | — | `8faed761d45a263340a0528343f099c05c9a4323` |
+| source `model.safetensors` SHA256 | — | `a961db72e75d52b18e6b0c9d379e51a26973b233385e0e127fdda7d648aec796` |
+| parameters | 494,291,712 | 1,544,158,208 |
+| ratio | | **3.1240x** |
+| `model_type` / `architectures` | `qwen2` / `Qwen2ForCausalLM` | identical |
+| tokenizer files | `tokenizer.json` / `vocab.json` / `merges.txt` | **byte-identical SHA256 to 0.5B** |
+
+Compatibility verdict: 7/7 structural checks passed; `missing_keys = 0`,
+`unexpected_keys = 0`, no load warnings.
+
+#### SID-token extension (exact wording)
+
+```
+new SID tokenizer tokens                 = 560
+tokenizer len                            : 151665 -> 152225
+pretrained model embedding rows           = 151936
+after resize                              = 152225
+actual newly allocated embedding rows     = 289
+```
+
+The pretrained model already had **271** rows of embedding capacity that the tokenizer did
+not occupy, so adding 560 SID tokens allocates only **289** genuinely new embedding rows.
+**0.5B and 1.5B behave identically here** (the model capacity field is 151936 in both configs
+while `len(tokenizer)` is 151665 in both). `tie_word_embeddings` stays `True` before and
+after the resize on both backbones.
+
+### 20.2 Memory probe (probe-only; not a formal run)
+
+A probe-only early-stop hook (`probe_optimizer_steps`, default `-1` = disabled) runs the
+**real** training configuration and stops after N genuine `optimizer.step()` calls, so the
+formal recipe is untouched. Default `-1` leaves the formal path unchanged, proven by
+constructing both `TrainingArguments` objects and comparing all 132 fields.
+
+Probe configuration and result:
+
+```
+micro = 4    accum = 16    effective batch = 64
+completed 4 real optimizer steps; no OOM
+peak torch allocated = 14.7402 GiB
+peak torch reserved  = 16.6797 GiB
+peak device VRAM     = 17.1504 GiB   (nvidia-smi sampling; a separate metric)
+optimizer state total = 5.7524 GiB
+  exp_avg     = torch.bfloat16
+  exp_avg_sq  = torch.bfloat16
+  step        = torch.float32
+  state entries = 338, all non-empty
+```
+
+**Why a real probe rather than arithmetic.** A paper assumption that the Adam state is fp32
+would have predicted roughly 12.35 GB of optimizer state for 1.5B. In this environment
+(`bf16=True`, `optim="adamw_torch"`) the two moments are materialised in **bf16**, i.e.
+**5.7524 GiB** — the paper estimate overstates the real footprint by about 6.6 GB. Feasibility
+was therefore decided by an actual optimizer-step probe, not by arithmetic.
+
+The probe also **understates** the formal peak: the formal runs reach 20.2285 GiB device
+because they additionally run 19 full validation passes and hold `load_best_model_at_end`
+state, which a 4-step probe cannot observe.
+
+### 20.3 1.5B Clean formal training
+
+```
+dataset : 36259 + 7316 + 36259 = 79834     valid = 4532
+epochs = 2      micro = 4        accum = 16      effective batch = 64
+lr = 3e-4       cutoff = 512     seed = 42
+bf16            adamw_torch      linear scheduler      warmup = 20
+full-parameter  freeze_LLM = False     train_from_scratch = False
+optimizer steps = 2496
+eval steps = 125 ... 2375  (19 evaluations, exactly the derived schedule)
+```
+
+| metric | value |
+|---|---|
+| `train_runtime` | 4378.2766 s |
+| `train_loss` | 0.7255943729064595 |
+| best eval loss | 1.5146195888519287 |
+| best checkpoint | 2375 |
+| peak device VRAM | 20.2285 GiB |
+| final model bytes | 3,088,354,952 |
+| final model SHA256 | `637d931a5f414e31634097843ce81288e95e2bcff04b049dbed23b65d437b6b9` |
+
+`final_checkpoint/model.safetensors` is **byte-identical** to
+`checkpoint-2375/model.safetensors` (same SHA256).
+
+### 20.4 1.5B Clean beam-20 evaluation
+
+Formal protocol: ORIGINAL test split, ORIGINAL info file, batch 8, beam 20,
+`num_return_sequences = 20`, `max_new_tokens = 256`, `length_penalty = 0`, seed 42, K = 0,
+constrained SID decoding, 4533 samples, cutoffs `[1, 3, 5, 10, 20]`.
+
+```
+HR   = [0.07103463, 0.10015442, 0.12000882, 0.15883521, 0.19964703]
+NDCG = [0.07103463, 0.08793411, 0.09604022, 0.10844943, 0.11877667]
+```
+
+| integrity check | value |
+|---|---|
+| prediction SHA256 | `e39f7984c3f4d86141e96ca59698c3c321dda9766564908c986986d1e338a76b` |
+| LegalRate | 1.0 |
+| DuplicateRate | 0.0 |
+| source-target alignment | 4533/4533 |
+
+Comparison against 0.5B Clean:
+
+| metric | 0.5B | 1.5B | absolute | percentage points | relative |
+|---|---|---|---|---|---|
+| HR@20 | 0.19832341 | 0.19964703 | +0.00132362 | **+0.1324 pp** | **+0.6674 %** |
+| NDCG@20 | 0.11786798 | 0.11877667 | +0.00090869 | **+0.0909 pp** | **+0.7709 %** |
+
+**The improvement is small and is not uniform across cutoffs**: HR@3 and HR@5 are slightly
+lower on 1.5B than on 0.5B, while HR@1 and HR@10 are higher. This is not evidence that
+scaling is significantly effective.
+
+### 20.5 1.5B strict shuffled formal training
+
+Strict shuffled artifact hashes (all re-verified immediately before the run):
+
+| artifact | SHA256 |
+|---|---|
+| `train.csv` | `3d9de81df61689c0afd54e3839f38e91e03cd5d51f894bc27224491148e843c2` |
+| `valid.csv` | `cfdfe75d60f7a5a834193181840505bcc9d1009912f54ad96b997967429e7cfc` |
+| `test.csv` | `4df7cddba99c173b250e91726e2364bc9219198e12a85f6d77f556bb218ff199` |
+| `Industrial_and_Scientific.index.json` | `2c0597261989e2fa015026142e8ad7d034fbf754edfe1b24ca2137f48740c2a1` |
+| `mapping.json` | `3a10b26740c637591ee1aab51313673afbbba6e397fc7bba46a52adc2739a1ea` |
+
+Intervention invariants are unchanged from the 0.5B study: collision-involved items frozen
+(31 items / 15 groups), singletons permuted within train next-item popularity bins,
+permutation seed 42, `singleton_fixed_points = 0`, `collision_items_changed = 0`, exact SID
+set / multiset preserved, trie topology preserved, vocab preserved.
+
+**Same formal recipe as Clean** — the only experimental variable is the item-to-SID
+assignment. Same dataset counts (36259 + 7316 + 36259 = 79834 / valid 4532), same 2496
+optimizer steps, same 19 evaluations at steps 125 ... 2375.
+
+| metric | value |
+|---|---|
+| `train_runtime` | 4416.7565 s |
+| `train_loss` | 0.7635543977913375 |
+| best eval loss | 1.639657974243164 |
+| best step | 2375 |
+| peak device VRAM | 20.2285 GiB |
+| final model SHA256 | `80eb8fa4ab7f898c6e6d031c1881d742b30ed57ff61f529c6f12c23a11bbfe74` |
+
+`final_checkpoint/model.safetensors` is **byte-identical** to
+`checkpoint-2375/model.safetensors`. It differs from the Clean 1.5B model (different SHA256),
+so no checkpoint was mixed between the two arms.
+
+#### ENOSPC failure record (kept as evidence, excluded from the formal results)
+
+The **first** attempt at this run failed at the very first checkpoint save:
+
+```
+directory : runs/qwen2p5_1p5b_shuffled_sft_failed_enospc_20261007_1153/
+window    : 2026-10-07 11:48:22 -> 11:53:03
+```
+
+- the data disk reached **100 % (2.1 MB free)** while writing the 6.18 GB `optimizer.pt` of
+  the step-125 checkpoint
+- symptom: `RuntimeError: [enforce fail at inline_container.cc:626] .
+  unexpected pos 523583488 vs 523583380` — `optimizer.pt` truncated at 523,632,896 B
+- `torchrun` exited 1; the step-125 `model.safetensors` was complete but the optimizer state
+  was truncated
+- remedy: data disk expanded **50 GB -> 100 GB**, then the formal run was **restarted from
+  scratch**
+- **no resume** was performed from the truncated optimizer state
+- the failed directory was **renamed only** (contents unchanged, verified by SHA256) and
+  retained; its files are **not** part of the formal results
+
+The model in that failed directory must not be reported as a formal result.
+
+### 20.6 1.5B shuffled beam-20 evaluation
+
+Formal protocol: **strict shuffled TEST + ORIGINAL INFO** (the original info file keeps the
+constrained-decoding legal SID space identical to Clean; the strict shuffled construction
+already preserves the same SID set / multiset / trie topology). All other decoding parameters
+are identical to the Clean and 0.5B shuffled formal evaluations; the default
+`evaluate.py` path was used with no benchmark timing callback.
+
+```
+HR   = [0.06397529, 0.08118244, 0.08890360, 0.10169865, 0.11625855]
+NDCG = [0.06397529, 0.07413859, 0.07729955, 0.08143041, 0.08510443]
+```
+
+| integrity check | value |
+|---|---|
+| prediction SHA256 | `450143d948162b44f601bbf0f5c31a10d739c0f4cb1ea438e7c1648ad1ee60a7` |
+| LegalRate | 1.0 |
+| DuplicateRate | 0.0 |
+| source-target alignment | 4533/4533 (against the strict shuffled TEST targets) |
+
+1.5B Clean -> Shuffled paired effect:
+
+| metric | Clean | Shuffled | absolute | percentage points | relative |
+|---|---|---|---|---|---|
+| HR@20 | 0.19964703 | 0.11625855 | -0.08338848 | **-8.3388 pp** | **-41.7680 %** |
+| NDCG@20 | 0.11877667 | 0.08510443 | -0.03367224 | **-3.3672 pp** | **-28.3492 %** |
+
+### 20.7 Final scaling comparison
+
+| backbone | regime | HR@20 | NDCG@20 |
+|---|---|---|---|
+| Qwen2.5-0.5B | Clean | 0.19832341 | 0.11786798 |
+| Qwen2.5-0.5B | Shuffled | 0.10765497 | 0.08157358 |
+| Qwen2.5-0.5B | **drop** | **-45.7175 %** | **-30.7924 %** |
+| Qwen2.5-1.5B | Clean | 0.19964703 | 0.11877667 |
+| Qwen2.5-1.5B | Shuffled | 0.11625855 | 0.08510443 |
+| Qwen2.5-1.5B | **drop** | **-41.7680 %** | **-28.3492 %** |
+
+Cross-backbone differences:
+
+| comparison | HR@20 | NDCG@20 |
+|---|---|---|
+| 0.5B -> 1.5B Clean | +0.1324 pp | +0.0909 pp |
+| 0.5B -> 1.5B Shuffled | +0.8604 pp | +0.3531 pp |
+| shuffled relative-drop difference between backbones | +3.9495 pp | +2.4432 pp |
+
+Bounded conclusion (verbatim):
+
+> Scaling Qwen2.5 from 0.5B to 1.5B produced only a small change in Clean Top-K
+> performance, while the large degradation under the strict shuffled-SID intervention
+> persisted.
+
+> This is a single-seed, single-category scaling sanity check; it is not evidence of
+> statistical significance or universal backbone invariance.
+
+Clean and shuffled rows are scored against **different splits** (a shuffled target SID is not
+comparable to a clean one), so the drop columns — not cross-column differences — carry the
+meaning. Only **absolute** differences and **percentage points** are reported for the
+cross-backbone deltas; **relative** percentages are used only for the within-arm drops.
+No significance test was performed.
+
+## 21. Qwen2.5-1.5B scaling artifact provenance
+
+| | |
+|---|---|
+| server archive | `/root/autodl-tmp/qwen2p5_1p5b_scaling_seed42_artifacts.tar.gz` |
+| local archive | `D:\IT\CODE\PYTHON\project1\MiniOneRec\qwen2p5_1p5b_scaling_seed42_artifacts.tar.gz` |
+| exact bytes | 4,901,207,952 |
+| SHA256 | `93ec93ab6a34594841aa41ba486a9f652fc823802e826a352467a29473c133e0` |
+| members | 47 |
+| server vs local | bytes and SHA256 identical |
+
+Archive contents: both `final_checkpoint` model+tokenizer sets, both `train.log`, both formal
+predictions, both `evaluate.log`, both `metrics.txt`, the strict shuffled inputs, the Stage-A
+probe provenance, and the manifest (`qwen2p5_1p5b_scaling_manifest.txt`).
+
+Deliberately **excluded** from the archive: every `optimizer.pt` (training complete, 6.18 GB
+each), the duplicate `checkpoint-2375` model (byte-identical to `final_checkpoint`), the
+failed ENOSPC directory (retained separately on the server), and the downloaded base
+checkpoint (its provenance is the revision plus the source SHA256 recorded in §20.1).

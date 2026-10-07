@@ -166,6 +166,36 @@ Doubling the beam buys **+0.0011 HR@20 absolute (+0.11 pp)** for **−54 % throu
 
 ---
 
+### (6b) Backbone scaling sanity check — Qwen2.5-0.5B vs 1.5B
+
+The full Clean vs. strict shuffled-SID protocol was repeated on a **3.12x larger backbone**
+(same Qwen2.5 family, same tokenizer, same formal recipe; only the backbone changed).
+
+| Backbone | Clean HR@20 | Shuffled HR@20 | HR drop | Clean NDCG@20 | Shuffled NDCG@20 | NDCG drop |
+|---|---|---|---|---|---|---|
+| Qwen2.5-0.5B | 0.19832341 | 0.10765497 | -45.7175% | 0.11786798 | 0.08157358 | -30.7924% |
+| Qwen2.5-1.5B | 0.19964703 | 0.11625855 | -41.7680% | 0.11877667 | 0.08510443 | -28.3492% |
+
+0.5B -> 1.5B Clean: **HR@20 +0.1324 pp**, **NDCG@20 +0.0909 pp**.
+0.5B -> 1.5B Shuffled: **HR@20 +0.8604 pp**, **NDCG@20 +0.3531 pp**.
+
+> Scaling Qwen2.5 from 0.5B to 1.5B produced only a small change in Clean Top-K
+> performance, while the large degradation under the strict shuffled-SID intervention
+> persisted.
+
+> This is a single-seed, single-category scaling sanity check; it is not evidence of
+> statistical significance or universal backbone invariance.
+
+The Clean gain is small and is **not** uniform across cutoffs: on 1.5B, HR@3 and HR@5 are
+slightly *lower* than on 0.5B while HR@1 and HR@10 are higher. Clean and shuffled rows are
+scored on different splits (a shuffled target SID is not comparable to a clean one), so the
+drop columns are the meaningful comparison, not the cross-column differences.
+
+0.5B remains the **project's main experimental backbone**; 1.5B is an extension check, not a
+second full replication. This step adds no significance claim and no causality claim.
+
+---
+
 ## 4. What I Changed
 
 ### Training-correctness fixes
@@ -649,8 +679,10 @@ than silently removed.
 
 ## 16. Next Step
 
-> Next: backbone-scaling sanity check with Qwen2.5-1.5B under the same Clean vs.
-> shuffled-SID protocol.
+The Qwen2.5-1.5B backbone-scaling sanity check described in
+[Key Results (6b)](#6b-backbone-scaling-sanity-check--qwen25-05b-vs-15b) is complete.
+
+> Future work: multi-seed / multi-category validation and broader backbone scaling.
 
 ---
 
