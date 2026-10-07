@@ -88,6 +88,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -146,6 +147,9 @@ QUALITY_SWEEP = {
 EFFICIENCY_BEAM = 20
 EFFICIENCY_BATCHES = (1, 8, 32)
 EFFICIENCY_SUBSET = 512          # first N test rows; identical for every batch size
+EFFICIENCY_SUBSET_NAME = f"efficiency_subset_{EFFICIENCY_SUBSET}.csv"
+EFFICIENCY_SUBSET_REL = f"_inputs/{EFFICIENCY_SUBSET_NAME}"
+EFFICIENCY_SUBSET_SELECTION = "first_512_in_original_csv_order"
 BATCH_INVARIANCE_BASELINE = 1    # reference arm for the invariance diagnostic
 
 # reference: formal clean SFT beam20 result (protocol-identity check)
@@ -262,19 +266,103 @@ def load_predictions(pred_path):
     return json.load(open(pred_path, encoding="utf-8"))
 
 
-def read_test_targets(n):
-    """First n targets of the ORIGINAL test split, in file order.
+def read_test_targets(n=None):
+    """Targets of the ORIGINAL test split, in file order (all rows when n is None).
 
     Justification for row-order alignment: evaluate.py builds its dataset with
     EvalSidDataset -> CSVBaseDataset, which does `pd.read_csv(train_file)` and
     only reshuffles when `sample > 0`. The benchmark always passes sample=-1
     (FORMAL_K convention kept: K=0, no sampling), so the dataset order equals
     the CSV order and prediction row i corresponds to CSV row i.
+
+    NOTE: this reads the ORIGINAL TEST file only. Use read_targets_from() when
+    the configuration being checked evaluates something else.
     """
+    return read_targets_from(TEST, n)
+
+
+def read_targets_from(csv_path, n=None):
+    """item_sid targets of an arbitrary test CSV, in file order."""
     import csv as _csv
-    with open(TEST, encoding="utf-8") as f:
+    with open(csv_path, encoding="utf-8") as f:
         rows = list(_csv.DictReader(f))
-    return [r["item_sid"].strip() for r in rows[:n]]
+    if n is not None:
+        rows = rows[:n]
+    return [r["item_sid"].strip() for r in rows]
+
+
+def write_efficiency_subset(out_root):
+    """Materialise the fixed efficiency workload from the ORIGINAL test split.
+
+    Writes the FIRST `EFFICIENCY_SUBSET` rows, in original CSV order, with the
+    header and every column preserved byte-for-byte, to
+    <out_root>/_inputs/efficiency_subset_512.csv.
+
+    This file is a provenance artifact of the benchmark: it is what the
+    efficiency configurations actually evaluate, so it is kept (not deleted)
+    and its SHA256 is recorded in results.json.
+
+    Why this exists
+    ---------------
+    An earlier revision only *declared* EFFICIENCY_SUBSET = 512 and then passed
+    the ORIGINAL test CSV to evaluate.main(), so the efficiency arm silently
+    evaluated all 4533 rows and the integrity gate failed with
+    `sample count 4533 != expected 512`. The subset has to be a real file that
+    is really handed to the protocol.
+
+    Returns the subset path.
+    """
+    subset_dir = os.path.join(out_root, "_inputs")
+    os.makedirs(subset_dir, exist_ok=True)
+    subset_path = os.path.join(subset_dir, EFFICIENCY_SUBSET_NAME)
+
+    with open(TEST, encoding="utf-8", newline="") as f:
+        lines = f.read().splitlines(keepends=True)
+    if len(lines) < EFFICIENCY_SUBSET + 1:
+        raise RuntimeError(
+            f"original test split has only {len(lines) - 1} data rows, "
+            f"cannot take {EFFICIENCY_SUBSET}")
+
+    # header + first N data rows, original order, everything preserved
+    with open(subset_path, "w", encoding="utf-8", newline="") as f:
+        f.writelines(lines[:EFFICIENCY_SUBSET + 1])
+
+    # ---- assertions: the subset must be exactly what was asked for --------
+    import csv as _csv
+    with open(TEST, encoding="utf-8", newline="") as f:
+        orig_rows = list(_csv.reader(f))
+    with open(subset_path, encoding="utf-8", newline="") as f:
+        sub_rows = list(_csv.reader(f))
+
+    if len(sub_rows) - 1 != EFFICIENCY_SUBSET:
+        raise RuntimeError(
+            f"efficiency subset has {len(sub_rows) - 1} data rows, "
+            f"expected {EFFICIENCY_SUBSET}")
+    if sub_rows[0] != orig_rows[0]:
+        raise RuntimeError("efficiency subset header differs from the original test")
+    if sub_rows[1:] != orig_rows[1:EFFICIENCY_SUBSET + 1]:
+        raise RuntimeError(
+            "efficiency subset rows are not identical to the first "
+            f"{EFFICIENCY_SUBSET} rows of the original test split")
+
+    return subset_path
+
+
+def efficiency_subset_provenance(subset_path):
+    """The block recorded in results.json so the workload is self-describing."""
+    import hashlib
+    h = hashlib.sha256(open(subset_path, "rb").read()).hexdigest()
+    return {
+        "source_test": os.path.relpath(TEST, PROJECT_ROOT).replace("\\", "/"),
+        "path": os.path.relpath(subset_path, PROJECT_ROOT).replace("\\", "/"),
+        "rows": EFFICIENCY_SUBSET,
+        "selection": EFFICIENCY_SUBSET_SELECTION,
+        "sha256": h,
+    }
+
+
+# results.json provenance, filled in by main() before the first write
+EFFICIENCY_PROVENANCE = None
 
 
 def check_source_target_alignment(preds, expected_targets):
@@ -390,8 +478,10 @@ def atomic_write_text(path, text):
 def render_results(records, out_root):
     """Return (json_text, csv_text) for the current record set."""
     doc = {"semantics": SEMANTICS,
-           "reference": REFERENCE,
-           "configurations": records}
+           "reference": REFERENCE}
+    if EFFICIENCY_PROVENANCE is not None:
+        doc["efficiency_subset"] = EFFICIENCY_PROVENANCE
+    doc["configurations"] = records
     json_text = json.dumps(doc, indent=2)
     cols = ["mode", "tag", "status", "beam", "batch_size", "num_samples",
             "num_candidates", "HR@1", "HR@3", "HR@5", "HR@10", "HR@20",
@@ -438,11 +528,16 @@ def write_results(records, out_root):
 # --------------------------------------------------------------------------- #
 
 
-def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=True):
+def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=True,
+             test_data_path=None, expected_targets_n=None):
     """Execute the formal protocol ONCE for this configuration.
 
     A single evaluate.main() call performs warmup (leading batches, discarded)
     and then the full measured pass, so the model is loaded exactly once.
+
+    `test_data_path` is passed through to evaluate.main() verbatim and is ALSO
+    the single source of the expected targets, so a configuration can never be
+    checked against a file other than the one it actually evaluated.
     """
     import torch
 
@@ -453,6 +548,10 @@ def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=T
     EV, err = import_evaluate()
     if EV is None:
         raise RuntimeError(f"cannot import evaluate from the benchmark context: {err}")
+
+    if test_data_path is None:
+        test_data_path = TEST
+    expected_n = num_samples if expected_targets_n is None else expected_targets_n
 
     run_dir = os.path.join(out_root, tag)
     pred_path = os.path.join(run_dir, "test_beam%d.json" % beam)
@@ -473,7 +572,7 @@ def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=T
         base_model=MAIN_MODEL,
         info_file=INFO,
         category=CATEGORY,
-        test_data_path=TEST,
+        test_data_path=test_data_path,
         result_json_data=pred_path,
         batch_size=batch_size,
         K=FORMAL_K,
@@ -500,8 +599,9 @@ def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=T
     gen_seconds = sum(batch_latencies) / 1000.0
 
     preds = load_predictions(pred_path)
-    expected_targets = read_test_targets(num_samples)
-    integ, problems = check_integrity(preds, INFO, num_samples, expected_targets)
+    # alignment is read from the VERY file that was handed to evaluate.main()
+    expected_targets = read_targets_from(test_data_path, expected_targets_n)
+    integ, problems = check_integrity(preds, INFO, expected_n, expected_targets)
     if problems:
         raise RuntimeError("integrity check failed: " + "; ".join(problems))
 
@@ -512,6 +612,7 @@ def run_once(*, mode, beam, batch_size, num_samples, out_root, tag, do_quality=T
         "beam": beam,
         "batch_size": batch_size,
         **integ,
+        "test_data_path": os.path.relpath(test_data_path, PROJECT_ROOT).replace("\\", "/"),
         "source_target_alignment": f"{len(preds)}/{len(expected_targets)}",
         "generation_seconds": gen_seconds,
         "wall_seconds_including_warmup_and_load": wall_seconds,
@@ -881,6 +982,74 @@ def preflight():
     chk("ConstrainedLogitsProcessor" in ev_src and "logits_processor" in ev_src,
         "evaluate.py still builds its own constrained logits processor")
 
+    # ---- 7. efficiency subset is a REAL workload, not just an expected count --
+    # Previous revision only declared EFFICIENCY_SUBSET = 512 and still handed
+    # the ORIGINAL test CSV to evaluate.main(), so the efficiency arm evaluated
+    # 4533 rows and the integrity gate failed. These checks make that class of
+    # bug impossible to reintroduce silently.
+    chk("efficiency_test = write_efficiency_subset(" in src,
+        "main() materialises the efficiency subset before running")
+    chk("efficiency_test, EFFICIENCY_SUBSET))" in src,
+        "efficiency plan entries carry the subset path AND its row count")
+    chk("TEST, None))" in src,
+        "quality plan entries carry the ORIGINAL test path")
+    run_src = ast.get_source_segment(src, run_once_fn)
+    chk("test_data_path=test_data_path" in run_src,
+        "run_once() hands its test_data_path straight to evaluate.main()")
+    chk("read_targets_from(test_data_path" in run_src,
+        "alignment targets are read from the SAME path that was evaluated")
+    chk('"test_data_path": os.path.relpath(test_data_path' in src,
+        "each record records the test_data_path it actually used")
+    chk(EFFICIENCY_SUBSET == 512, "EFFICIENCY_SUBSET == 512", str(EFFICIENCY_SUBSET))
+    chk(EFFICIENCY_SUBSET_REL.endswith(EFFICIENCY_SUBSET_NAME),
+        "subset artifact name derives from EFFICIENCY_SUBSET", EFFICIENCY_SUBSET_REL)
+    chk("efficiency_subset" in src and '"sha256"' in src,
+        "results.json records the efficiency_subset provenance block")
+
+    # CPU-only materialisation self-check: actually build the subset in a temp
+    # dir and confirm the resulting FILE has 512 data rows identical to the
+    # original's first 512, with an identical header.
+    _selfcheck_dir = None
+    try:
+        import shutil
+        # A deterministic path next to this file. mkdtemp() would give a random
+        # name, and some sandboxed filesystems refuse to create subdirectories
+        # inside a directory they did not see created explicitly -- which would
+        # make this self-check fail for reasons unrelated to the benchmark.
+        _selfcheck_dir = os.path.join(_ANALYSIS_DIR, ".bench_subset_check")
+        shutil.rmtree(_selfcheck_dir, ignore_errors=True)
+        shutil.rmtree(_selfcheck_dir, ignore_errors=True)
+        sp = write_efficiency_subset(_selfcheck_dir)
+        import csv as _csv
+        with open(sp, encoding="utf-8", newline="") as f:
+            sub = list(_csv.reader(f))
+        with open(TEST, encoding="utf-8", newline="") as f:
+            org = list(_csv.reader(f))
+        chk(os.path.basename(sp) == EFFICIENCY_SUBSET_NAME,
+            "materialised subset filename is the declared one",
+            os.path.basename(sp))
+        chk(len(sub) - 1 == EFFICIENCY_SUBSET,
+            "materialised subset file has exactly 512 data rows",
+            f"{len(sub) - 1} data rows")
+        chk(sub[0] == org[0],
+            "materialised subset header matches the original test header",
+            f"{len(sub[0])} columns")
+        chk(sub[1:] == org[1:EFFICIENCY_SUBSET + 1],
+            "subset rows are byte-identical to the original's first 512 rows")
+        chk(len(read_targets_from(sp)) == EFFICIENCY_SUBSET,
+            "read_targets_from(subset) returns 512 targets",
+            str(len(read_targets_from(sp))))
+        chk(len(read_targets_from(TEST)) == len(org) - 1,
+            "read_targets_from(ORIGINAL TEST) returns every row",
+            str(len(read_targets_from(TEST))))
+        shutil.rmtree(_selfcheck_dir, ignore_errors=True)
+        chk(not os.path.exists(_selfcheck_dir)
+            or not os.listdir(_selfcheck_dir),
+            "self-check cleaned up after itself (no artifact left behind)")
+    except Exception as e:                                    # noqa: BLE001
+        chk(False, "efficiency subset materialisation self-check",
+            f"{type(e).__name__}: {e}")
+
     # ---- 11. inputs / outputs ---------------------------------------------
     chk(os.path.exists(INFO), "ORIGINAL INFO exists", INFO)
     chk(os.path.exists(TEST), "original test split exists", TEST)
@@ -982,6 +1151,19 @@ def main():
         return 2
     os.makedirs(args.out_dir)
 
+    # ------------------------------------------------------------------ subset
+    # Materialise the efficiency workload BEFORE any run, so the file the
+    # efficiency configurations evaluate is a recorded provenance artifact and
+    # its hash is in results.json from the very first write.
+    global EFFICIENCY_PROVENANCE
+    efficiency_test = None
+    if args.mode in ("efficiency", "all"):
+        efficiency_test = write_efficiency_subset(args.out_dir)
+        EFFICIENCY_PROVENANCE = efficiency_subset_provenance(efficiency_test)
+        print(f"  efficiency workload: {EFFICIENCY_PROVENANCE['path']}  "
+              f"rows={EFFICIENCY_PROVENANCE['rows']}  "
+              f"sha256={EFFICIENCY_PROVENANCE['sha256'][:16]}...")
+
     records = []
     failed = None
 
@@ -989,18 +1171,22 @@ def main():
     if args.mode in ("quality", "all"):
         for beam, cut in QUALITY_SWEEP.items():
             plan.append(("quality", beam, FORMAL_BATCH_SIZE, 4533,
-                         f"quality_beam{beam}_batch{FORMAL_BATCH_SIZE}", cut, True))
+                         f"quality_beam{beam}_batch{FORMAL_BATCH_SIZE}", cut, True,
+                         TEST, None))
     if args.mode in ("efficiency", "all"):
         for bs in EFFICIENCY_BATCHES:
             plan.append(("efficiency", EFFICIENCY_BEAM, bs, EFFICIENCY_SUBSET,
-                         f"efficiency_beam{EFFICIENCY_BEAM}_batch{bs}", None, False))
+                         f"efficiency_beam{EFFICIENCY_BEAM}_batch{bs}", None, False,
+                         efficiency_test, EFFICIENCY_SUBSET))
 
-    for mode, beam, bs, n, tag, cut, do_quality in plan:
+    for mode, beam, bs, n, tag, cut, do_quality, tpath, tgt_n in plan:
         print(f"\n=== [{mode}] {tag}  beam={beam} batch={bs} samples={n}"
               + (f"  cutoffs={list(cut)}" if cut else ""))
+        print(f"    test_data_path = {os.path.relpath(tpath, PROJECT_ROOT)}")
         try:
             rec = run_once(mode=mode, beam=beam, batch_size=bs, num_samples=n,
-                           out_root=args.out_dir, tag=tag, do_quality=do_quality)
+                           out_root=args.out_dir, tag=tag, do_quality=do_quality,
+                           test_data_path=tpath, expected_targets_n=tgt_n)
         except Exception as e:
             rec = {"mode": mode, "tag": tag, "status": "FAILED",
                    "beam": beam, "batch_size": bs, "num_samples": n,
