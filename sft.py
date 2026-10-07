@@ -27,6 +27,35 @@ from datasets import Dataset as HFDataset
 from torch.utils.data import ConcatDataset
 
 
+class ProbeEarlyStopCallback(transformers.TrainerCallback):
+    """Probe-only: stop training after N *real optimizer* steps.
+
+    Registered ONLY when probe_optimizer_steps > 0, so the formal training path
+    is completely unaffected when the flag is left at its default (-1).
+
+    The stopping test is `state.global_step`, which the Trainer advances once per
+    `optimizer.step()` -- NOT per dataloader microbatch. With
+    gradient_accumulation_steps = 16, global_step 4 therefore means 64 microbatches
+    have been consumed and the optimizer has stepped 4 times.
+
+    Nothing about the formal configuration is altered: TrainingArguments still
+    receives num_train_epochs=2, warmup_steps=20 and eval_steps/save_steps=0.05,
+    so the linear-scheduler horizon, the warmup and the eval/save cadence are all
+    derived from the full 2496-step schedule exactly as in a real run. The probe
+    simply leaves that schedule early.
+    """
+
+    def __init__(self, stop_after: int):
+        self.stop_after = int(stop_after)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= self.stop_after:
+            control.should_training_stop = True
+            print(f"[probe] reached optimizer global_step {state.global_step} "
+                  f">= probe_optimizer_steps {self.stop_after}; stopping early")
+        return control
+
+
 class TokenExtender:
     def __init__(self, data_path, dataset, index_file=".index.json"):
         self.data_path = data_path
@@ -114,6 +143,7 @@ def train(
     sid_index_path: str = "",
     item_meta_path: str = "",
     sft_mode: str = "full",  # "full" = upstream recipe | "seq_only" = SidSFTDataset only
+    probe_optimizer_steps: int = -1,  # <=0 = disabled (formal behaviour); >0 = stop after N real optimizer steps
 ):
     set_seed(seed)
     os.environ['WANDB_PROJECT'] = wandb_project
@@ -242,6 +272,18 @@ def train(
     print(hf_train_dataset)
     print(hf_val_dataset)
     eval_step = 0.05
+    probe_mode = probe_optimizer_steps is not None and probe_optimizer_steps > 0
+    if probe_mode:
+        # Formal TrainingArguments below are unchanged; the probe only measures and
+        # stops early. Print the config it is measuring against so the report is
+        # self-describing.
+        print(f"[probe] ENABLED probe_optimizer_steps={probe_optimizer_steps} "
+              f"(will stop after that many real optimizer steps)")
+        print(f"[probe] frozen formal config kept intact: "
+              f"num_epochs={num_epochs} batch_size={batch_size} "
+              f"micro_batch_size={micro_batch_size} "
+              f"gradient_accumulation_steps={gradient_accumulation_steps} "
+              f"warmup_steps=20 eval_step={eval_step} bf16=True optim=adamw_torch")
     trainer = transformers.Trainer(
         # deepspeed=deepspeed,
         model=model,
@@ -273,12 +315,60 @@ def train(
         data_collator=transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         ),
-        callbacks = [EarlyStoppingCallback(early_stopping_patience=3)],
+        callbacks = ([EarlyStoppingCallback(early_stopping_patience=3)]
+                     + ([ProbeEarlyStopCallback(probe_optimizer_steps)] if probe_mode else [])),
         # optimizers=(optimizer, lr_scheduler) 
     )
     model.config.use_cache = False
     
+    if probe_mode and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        print("[probe] torch.cuda.reset_peak_memory_stats() done before train()")
+
     trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+    if probe_mode:
+        # ---- probe report: memory + optimizer state -------------------------
+        print("[probe] ================ PROBE REPORT ================")
+        print(f"[probe] trainer.state.global_step = {trainer.state.global_step}")
+        print(f"[probe] trainer.state.epoch       = {trainer.state.epoch}")
+        if torch.cuda.is_available():
+            alloc = torch.cuda.max_memory_allocated()
+            reserv = torch.cuda.max_memory_reserved()
+            print(f"[probe] max_memory_allocated = {alloc} B = {alloc/1024**3:.4f} GiB")
+            print(f"[probe] max_memory_reserved  = {reserv} B = {reserv/1024**3:.4f} GiB")
+        opt = getattr(trainer, "optimizer", None)
+        if opt is None:
+            print("[probe] trainer.optimizer is None -> no optimizer")
+        else:
+            print(f"[probe] optimizer class = {type(opt).__name__}")
+            st = opt.state
+            n_with = sum(1 for v in st.values() if v)
+            print(f"[probe] optimizer.state entries = {len(st)}  non-empty = {n_with}")
+            dt = {}
+            tot = 0
+            for v in st.values():
+                for k, t in v.items():
+                    if torch.is_tensor(t):
+                        key = f"{k}:{t.dtype}"
+                        dt[key] = dt.get(key, 0) + t.numel() * t.element_size()
+                        tot += t.numel() * t.element_size()
+            print(f"[probe] optimizer state total bytes = {tot} = {tot/1024**3:.4f} GiB")
+            for k in sorted(dt):
+                print(f"[probe]   {k:24s} {dt[k]:>14,d} B  ({dt[k]/1024**3:.4f} GiB)")
+            first = next((v for v in st.values() if v), None)
+            if first:
+                for k in ("exp_avg", "exp_avg_sq", "step"):
+                    if k in first:
+                        t = first[k]
+                        print(f"[probe] param0 {k:10s} dtype={getattr(t,'dtype',type(t).__name__)} "
+                              f"shape={getattr(t,'shape',None)}")
+        print("[probe] ==============================================")
+        # a memory probe must not leave a 3 GB model dump behind
+        print("[probe] skipping trainer.save_model / save_pretrained (probe mode)")
+        return
+
     trainer.save_model(output_dir)
     
     output_dir = os.path.join(output_dir, "final_checkpoint")
