@@ -623,9 +623,354 @@ result. Verified: masks built from the two orders are byte-identical.)*
 
 ---
 
-## 14. Reproducibility artifacts
+---
 
-### 14.1 Scripts
+## 14. Sequence-only SID ablation
+
+**Status:** completed. This section is the authoritative record for the seq-only arm.
+
+### 14.1 Design
+
+The `SidSFTDataset` path is kept; the two explicit text-auxiliary supervision paths are
+removed:
+
+| Component | Full SFT | Seq-only |
+|---|---|---|
+| `SidSFTDataset` (history SID -> target SID) | retained | **retained** |
+| `SidItemFeatDataset` (title/description <-> SID alignment) | retained | **removed** |
+| `FusionSeqRecDataset` (history SID -> target title) | retained | **removed** |
+
+Implemented as `sft_mode in {"full", "seq_only"}` in `sft.py`; the mode is logged and the
+launcher passes it explicitly. Both arms keep **identical** protocol constants
+(epochs 2, `batch_size 64`, `micro_batch_size 16`, `gradient_accumulation_steps 4`,
+`learning_rate 3e-4`, `cutoff_len 512`, `seed 42`, `sample -1`, `train_from_scratch False`,
+`freeze_LLM False`, `bf16 True`, `optimizer adamw_torch`, `scheduler linear`,
+`warmup_steps 20`), and differ in exactly four paths (`train_file`, `eval_file`,
+`sid_index_path`, `output_dir`).
+
+**Scope of the removal, stated precisely.** What is removed is the **explicit text
+auxiliary supervision** (the title/description alignment objectives). It is **not** a
+removal of all textual semantics from the system: the Semantic IDs themselves are produced
+upstream by text quantisation (RQ-VAE), and that is unchanged in both arms.
+
+Training shape follows from the dataset composition:
+
+| Quantity | Full SFT | Seq-only |
+|---|---|---|
+| train samples | 79 834 (= 36 259 + 7 316 + 36 259) | **36 259** |
+| `train dataset components` log line | three components | **36259 = 36259** (single component) |
+| optimizer steps / epoch | 1 248 | **567** |
+| max optimizer steps | 2 496 | **1 134** |
+| eval interval (0.05) | 125 | **57** |
+| actual final `global_step` | 2 496 | **1 134** |
+| final epoch | 2.0 | 2.0 |
+| early stopping | none | none |
+| `train_loss` (all-step mean) | 0.7712313783569977 | 2.1893415668654064 |
+| `train_runtime` | 1 532.3791 s | 758.5922 s |
+
+Both seq-only arms ran the full 1 134 steps with no early stopping, with 19 evaluations at
+steps 57, 114, ..., 1 083. Launch traces confirm `SFT mode: seq_only` and a single dataset
+component, i.e. neither `SidItemFeatDataset` nor `FusionSeqRecDataset` was instantiated.
+
+### 14.2 Clean seq-only
+
+Formal protocol: ORIGINAL test split, 4 533 samples, beam 20, constrained SID decoding,
+ORIGINAL INFO, `calc.py` unmodified.
+
+| K | HR@K | NDCG@K |
+|---|---|---|
+| 1 | 0.06618134 | 0.06618134 |
+| 3 | 0.09353629 | 0.08182290 |
+| 5 | 0.11361129 | 0.08999502 |
+| 10 | 0.14339290 | 0.09966412 |
+| **20** | **0.17802780** | **0.10842814** |
+
+### 14.3 Shuffled seq-only
+
+The same protocol with only the item<->SID assignment shuffled (strict shuffled builder,
+seed 42) and the shuffled test split.
+
+| K | HR@K | NDCG@K |
+|---|---|---|
+| 1 | 0.05978381 | 0.05978381 |
+| 3 | 0.07434370 | 0.06842129 |
+| 5 | 0.08030002 | 0.07086086 |
+| 10 | 0.08956541 | 0.07385714 |
+| **20** | **0.10125745** | **0.07683363** |
+
+### 14.4 Paired effect
+
+| Metric | Clean | Shuffled | absolute d | relative d |
+|---|---|---|---|---|
+| HR@20 | 0.17802780 | 0.10125745 | **-0.07677035** | **-43.1227 %** |
+| NDCG@20 | 0.10842814 | 0.07683363 | **-0.03159451** | **-29.1387 %** |
+
+Both arms were generated and scored identically: `legal_rate = 1.0`,
+`duplicate_rate = 0.0`, source-target alignment 4533/4533 in both.
+
+### 14.5 Comparison with the full-SFT intervention
+
+| Arm | HR@20 clean -> shuffled | relative d | NDCG@20 clean -> shuffled | relative d |
+|---|---|---|---|---|
+| Full SFT (section 10) | 0.19832341 -> 0.10765497 | **-45.7175 %** | 0.11786798 -> 0.08157358 | **-30.7924 %** |
+| Seq-only (section 14) | 0.17802780 -> 0.10125745 | **-43.1227 %** | 0.10842814 -> 0.07683363 | **-29.1387 %** |
+
+Absolute-drop ratio (seq-only / full): **0.8467** on HR@20, **0.8705** on NDCG@20.
+
+**Permitted conclusion.** *The shuffled-SID effect remains large after removing the explicit
+text auxiliary tasks, so the full-SFT intervention effect is not mainly dependent on those
+auxiliary supervision paths.*
+
+**Not claimed.** This does **not** prove a causal semantic hierarchy; it does **not** mean
+text information was removed from the system (the SIDs remain text-quantised upstream); and
+it is **not** a universal conclusion. It is one category, one dataset, single seed, and the
+two arms differ by more than the auxiliary tasks: the full arm also trains on 79 834 samples
+versus 36 259, so this is not a single-variable isolation.
+
+---
+
+## 15. Reference reproduction (formal clean SFT checkpoint)
+
+**Status:** completed, PASS.
+
+The formal clean SFT checkpoint was restored from its archive and re-evaluated under the
+**formal protocol** (ORIGINAL test split, 4 533 samples, beam 20, `batch_size 8`,
+`max_new_tokens 256`, `length_penalty 0`, `seed 42`, `K 0`, ORIGINAL INFO constrained
+decoding), using the committed `evaluate.py` **default path** -- that is, with
+`timing_callback = None` and `warmup_batches = 0`, so the benchmark instrumentation is
+entirely inert.
+
+| Item | Value |
+|---|---|
+| model | `runs/industrial_sft/final_checkpoint` |
+| model SHA256 | `c362ed183daeb290299a475932ee9067cc0189e8199fac3fa080b054c12bffe8` |
+| beam-20 prediction SHA256 | `51903f9babf883fbbd9b0ab9e22e1a41ed226a9caa80be5beb0bbad180a1fb36` |
+| HR@20 | **0.19832341** |
+| NDCG@20 | **0.11786798** |
+
+Full curve re-derived by the unmodified `calc.py`:
+
+| K | HR@K | NDCG@K |
+|---|---|---|
+| 1 | 0.06926980 | 0.06926980 |
+| 3 | 0.10103684 | 0.08789727 |
+| 5 | 0.12111185 | 0.09613706 |
+| 10 | 0.15376131 | 0.10663781 |
+| **20** | **0.19832341** | **0.11786798** |
+
+Integrity: 4 533 samples, 20 candidates per sample, source-target alignment 4533/4533,
+`legal_rate = 1.0`, `duplicate_rate = 0.0`, `calc.py` CC = 0.
+
+**The restored checkpoint under the formal protocol produces a byte-identical historical
+prediction artifact.** The re-generated prediction matches the archived 2026-10-04
+`eval_clean_sft/test_beam20.json` byte for byte (same SHA256 above, 4 740 761 bytes).
+
+**Not claimed.** This does **not** cryptographically prove that the historical model weights
+were identical, because a model SHA256 was not recorded separately at the time the original
+prediction was produced.
+
+---
+
+## 16. Inference quality-latency benchmark
+
+**Status:** completed. Formal HEAD `a5bbffbeb97ff43725807d04c72188a79c97184e`.
+
+Design: the benchmark does not re-implement the recommender protocol. It imports the
+repository's own `evaluate.py` and calls `evaluate.main()`, so prompts, SID parsing, the
+constrained-decoding trie and the generation call are exactly the formal ones.
+`warmup_batches = 3` leading batches run inside that same single call on the same loaded
+model and are discarded. Timing is `torch.cuda.synchronize()`-bracketed around
+`model.generate()` only, and `peak_vram_gb` is `torch.cuda.max_memory_allocated()` over the
+measured window, reset after warmup and before the measured loop. Model loading, warmup,
+JSON writing and `calc.py` are all excluded.
+
+**Metric identity.** HR/NDCG come from the **unmodified `calc.py`** against the **ORIGINAL
+INFO** universe. `calc.py`'s `item_path` builds `item_dict`, which is used only for its CC
+counter and never participates in HR/NDCG. This was verified empirically: scoring the same
+prediction file against the full 3 686-line codebook and against a 7-line codebook yields
+bit-identical HR and NDCG, with only CC changing. No SID universe is therefore ever shrunk.
+
+### 16.1 Quality sweep -- 4 533 rows, batch 8
+
+| beam | HR@20 | NDCG@20 | throughput (samples/s) | P50 (ms) | P95 (ms) | peak_vram (GB) |
+|---|---|---|---|---|---|---|
+| 5 | n/a | n/a | 61.3478374396416 | 130.8477409183979 | 135.72994153946638 | 1.206432819366455 |
+| 10 | n/a | n/a | 45.3665881245472 | 178.48706617951393 | 184.45707205682993 | 1.4817638397216797 |
+| **20** | **0.19832341** | **0.11786798** | 27.492844813594353 | 300.1663228496909 | 308.5384462028742 | 2.0328612327575684 |
+| 50 | 0.19942643 | 0.11818527 | 12.599104297375016 | 649.2519378662109 | 668.6710128560662 | 3.684891700744629 |
+
+beam 5 and beam 10 cannot report @20, because a beam-k run emits only k candidates. Those
+cells are **absent, not zero**.
+
+Per-cutoff quality for every beam (available cutoffs only):
+
+| beam | HR@1 | HR@3 | HR@5 | HR@10 |
+|---|---|---|---|---|
+| 5 | 0.0692698 | 0.09949261 | 0.11824399 | n/a |
+| 10 | 0.0694904 | 0.10015442 | 0.11978822 | 0.15287889 |
+| 20 | 0.0692698 | 0.10103684 | 0.12111185 | 0.15376131 |
+| 50 | 0.0694904 | 0.10147805 | 0.12133245 | 0.1533201 |
+
+| beam | NDCG@1 | NDCG@3 | NDCG@5 | NDCG@10 |
+|---|---|---|---|---|
+| 5 | 0.0692698 | 0.08666302 | 0.09432308 | n/a |
+| 10 | 0.0694904 | 0.08730641 | 0.09535618 | 0.10599019 |
+| 20 | 0.0692698 | 0.08789727 | 0.09613706 | 0.10663781 |
+| 50 | 0.0694904 | 0.08811264 | 0.09629609 | 0.10658415 |
+
+The beam-20 / batch-8 configuration reproduced the formal clean SFT reference exactly
+(`reference_match = True`), which is the protocol-identity check for the whole sweep.
+
+### 16.2 Efficiency sweep -- beam 20, fixed first-512 workload
+
+The workload is a materialised artifact:
+`runs/inference_benchmark/_inputs/efficiency_subset_512.csv`, the first 512 rows of the
+ORIGINAL test split in original order
+(`selection = first_512_in_original_csv_order`), verified row-for-row identical to the
+original's first 512 rows, SHA256
+`5927985aae76180c008a2c687329579a2187ceb572304385b183d0e9a58e2d85`. All three batch sizes
+evaluate exactly this file.
+
+| batch | rows | batches | throughput (samples/s) | P50 (ms) | P95 (ms) | peak_vram (GB) | peak_device_used (GB) |
+|---|---|---|---|---|---|---|---|
+| 1 | 512 | 512 | 11.534300906608772 | 85.62689460813999 | 90.66069684922695 | 1.0689444541931152 | 5.5343017578125 |
+| **8** | 512 | 64 | 27.28226106430246 | 300.14239344745874 | 305.5367525666952 | 2.0326876640319824 | 5.5343017578125 |
+| 32 | 512 | 16 | 30.33084794150578 | 1041.725986637175 | 1049.0986537188292 | 5.338920593261719 | 6.9874267578125 |
+
+For batch 1 the single-request latency is the same measurement, recorded as
+`request_latency_p50_ms = 85.62689460813999` and
+`request_latency_p95_ms = 90.66069684922695`.
+
+`peak_vram_gb` and `peak_device_used_gb` are different quantities and are deliberately
+separately named: the former is PyTorch peak allocated memory over the measured generation
+window, the latter is a device-level proxy that includes the CUDA context.
+
+### 16.3 Interpretation
+
+**Balanced operating point: `beam = 20, batch = 8`.**
+
+- **beam 50 vs beam 20.** HR@20 0.19832341 -> 0.19942643 and NDCG@20
+  0.11786798 -> 0.11818527, i.e. **+0.00110302 absolute (+0.1103 pp)** and
+  **+0.00031729 absolute (+0.0317 pp)** -- a marginal Top-20 gain -- while throughput falls
+  from 27.49 to 12.60 samples/s (**-54.2 %**, i.e. **0.458x**), P50 rises
+  300.17 -> 649.25 ms (**2.16x**) and peak VRAM rises 2.033 -> 3.685 GB (**1.81x**).
+- **batch 32 vs batch 8.** Throughput 27.28 -> 30.33 samples/s (**+11.2 %**, **1.112x**)
+  only, while batch latency rises 300.14 -> 1 041.73 ms (**3.47x**) and peak VRAM rises
+  2.033 -> 5.339 GB (**2.63x**).
+
+No recommendation-quality claim is made from the efficiency sweep alone; its quality axis is
+section 16.1.
+
+---
+
+## 17. Batch-invariance caveat (inference benchmark)
+
+The efficiency sweep re-runs the **same 512 samples** at three batch sizes. Predictions were
+compared row by row on `output.strip()` and on the `predict` list (not by file digest):
+
+| comparison | exact prediction match rate | mismatch rows |
+|---|---|---|
+| batch 1 vs batch 8 | **0.0078125** | 508 / 512 |
+| batch 1 vs batch 32 | **0.009765625** | 507 / 512 |
+
+Aggregate quality on those same 512 rows (unmodified `calc.py`, ORIGINAL INFO):
+
+| batch | HR@20 | NDCG@20 |
+|---|---|---|
+| 1 | **0.18359375** | 0.13043159 |
+| 8 | **0.18359375** | 0.13039623 |
+| 32 | **0.18359375** | 0.13022071 |
+
+**Batch-dependent prediction divergence was observed, while aggregate HR/NDCG remained
+nearly stable.**
+
+This is recorded as an observation only. **No root cause is claimed** -- floating-point
+non-determinism is not asserted here, because it has not been demonstrated for this system.
+The divergence did **not** fail the benchmark: by design it is reported as a warning, and it
+left the subset HR@20 unchanged and moved NDCG@20 by less than 2.2e-4.
+
+---
+
+## 18. Final artifact provenance (inference stage)
+
+### 18.1 Final inference benchmark archive
+
+| Item | Value |
+|---|---|
+| server path | `/root/autodl-tmp/inference_benchmark_final_artifacts.tar.gz` |
+| server manifest | `/root/autodl-tmp/inference_benchmark_manifest.txt` |
+| local path | `D:\IT\CODE\PYTHON\project1\MiniOneRec\inference_benchmark_final_artifacts.tar.gz` |
+| size | **2 436 201 bytes** |
+| SHA256 | `0cf94966439c4168a0537c1eb279737eeccfb321763730768687f412ef7717ad` |
+| members | 35 |
+| contents | `runs/inference_benchmark/` (results.json, results.csv, `_inputs/efficiency_subset_512.csv`, 4 quality configurations, 3 efficiency configurations) plus `runs/reference_full_clean_beam20/` and the manifest |
+| deliberately excluded | model weights (already archived separately) and the two historical failed-run directories |
+
+Local and server SHA256 and byte size were verified identical after download, and the tar
+listing was enumerated on both sides.
+
+Hashes recorded inside that archive:
+
+| Artifact | SHA256 |
+|---|---|
+| `results.json` | `f228ad9f10f35595a99c714961999c7d9080dd0c243d168cd9ccb74c43060035` |
+| `results.csv` | `dccea8958296a472d9b0dc53dbcc52f1919e0dee923544feed0ec6b8b8167821` |
+| `_inputs/efficiency_subset_512.csv` | `5927985aae76180c008a2c687329579a2187ceb572304385b183d0e9a58e2d85` |
+| reference prediction | `51903f9babf883fbbd9b0ab9e22e1a41ed226a9caa80be5beb0bbad180a1fb36` |
+
+### 18.2 Related archives
+
+| Archive | Contents | Size | SHA256 |
+|---|---|---|---|
+| `minionerec_final_artifacts.tar.gz` | shuffled-SID SFT and shuffled evaluation artifacts | 791 253 788 B | recorded in the section 10 stage |
+| `seq_only_ablation_seed42_artifacts.tar.gz` | sequence-only ablation: both arms' checkpoints, logs, predictions and metrics | 1 576 997 229 B | `5958d864ab66967080415ca3348a835fc028f6760f2875a46526d169281b6772` |
+| `inference_benchmark_final_artifacts.tar.gz` | inference quality-latency benchmark and reference reproduction | 2 436 201 B | `0cf94966439c4168a0537c1eb279737eeccfb321763730768687f412ef7717ad` |
+
+### 18.3 Scripts and launchers added in these stages
+
+| Path | Purpose |
+|---|---|
+| `scripts/sft_seq_only_clean.sh` | seq-only SFT on clean data |
+| `scripts/sft_seq_only_shuffled.sh` | seq-only SFT on shuffled data (4 paths differ) |
+| `scripts/eval_seq_only_clean.sh` | seq-only beam-20 evaluation, clean |
+| `scripts/eval_seq_only_shuffled.sh` | seq-only beam-20 evaluation, shuffled |
+| `analysis/preflight_seq_only_ablation.sh` | seq-only static preflight (24 checks) |
+| `analysis/benchmark_inference.py` | inference quality-latency benchmark with a `--preflight` mode (122 checks) |
+| `scripts/benchmark_inference.sh` | benchmark launcher; its correctness gate delegates to the Python preflight |
+
+### 18.4 Inference-benchmark method notes worth keeping
+
+- **The benchmark never re-implements the protocol.** It imports the repository's own
+  `evaluate.py`. An AST-based guard in `--preflight` asserts that
+  `ConstrainedLogitsProcessor`, `GenerationConfig`, `LogitsProcessorList`, `EvalSidDataset`,
+  `hash_dict` and `get_hash` appear neither as calls nor as literals in the benchmark.
+- **Runtime import is checked for real.** An earlier revision passed 99 static checks and
+  still failed at the first configuration with `ModuleNotFoundError: No module named
+  'evaluate'`, because the repository root was not on `sys.path` while the check was only a
+  source-text assertion. The preflight now performs the actual import through the
+  benchmark's own configured `sys.path` and fails if it does not succeed.
+- **The efficiency subset is a real file, not just an expected count.** An earlier revision
+  declared `EFFICIENCY_SUBSET = 512` but still handed the original 4 533-row test CSV to
+  `evaluate.main()`, so the efficiency arm silently evaluated the full split and the
+  integrity gate failed with `sample count 4533 != expected 512`. The subset is now
+  materialised, asserted (row count, header, row-for-row equality) and passed as
+  `test_data_path`; the expected targets are read from that same path.
+- **A launcher guard was a false positive.** The first launcher used a bare
+  `grep -q 'analysis/results'` over the benchmark source, which matched the benchmark's own
+  provenance assertion text and made the committed launcher refuse to run. That string
+  search was deleted rather than replaced by another string search: the correctness gate now
+  delegates to the AST-based Python preflight and requires exit 0 with zero failures.
+- **Results are persisted atomically after every configuration**
+  (temp file, `os.fsync`, `os.replace`), so a later failure cannot lose earlier
+  configurations, and a failed configuration is recorded with `status = "FAILED"` rather
+  than as a success.
+
+---
+
+## 19. Reproducibility artifacts
+
+### 19.1 Scripts
+
 
 | Path | Purpose |
 |---|---|
@@ -634,7 +979,7 @@ result. Verified: masks built from the two orders are byte-identical.)*
 | `baselines/sasrec_baseline.py`, `baselines/sasrec_sweep.sh` | compact SASRec + sweep driver |
 | `sft.py`, `evaluate.py`, `calc.py`, `data.py` | pipeline (evaluation code unmodified) |
 
-### 14.2 Analysis
+### 19.2 Analysis
 
 | Path | Purpose |
 |---|---|
@@ -647,7 +992,7 @@ result. Verified: masks built from the two orders are byte-identical.)*
 | `analysis/analyze_sid_value.py`, `analyze_sid_prefix_control.py`, `analyze_sid_prefix_matched_control.py`, `analyze_pair_identity_retention.py` | §9 and §10.1 analyses |
 | `analysis/preflight_shuffled_sft.sh`, `preflight_eval_shuffled_sid.sh` | static preflights |
 
-### 14.3 Results
+### 19.3 Results
 
 | Path | Contents |
 |---|---|
@@ -659,7 +1004,7 @@ result. Verified: masks built from the two orders are byte-identical.)*
 | `analysis/results/clean_vs_shuffled_sft_recipe.md` | training recipe diff |
 | `analysis/results/clean_vs_shuffled_eval_recipe.md` | evaluation protocol diff |
 
-### 14.4 Method notes worth keeping
+### 19.4 Method notes worth keeping
 
 - **`calc.py` NDCG scale.** `calc.py` accumulates `1/log(minID + 2)` with the **natural**
   logarithm and converts to the log2 scale only at print time by dividing by

@@ -2,7 +2,7 @@
 
 <img src="./assets/logo.png" width="420em" ></img>
 
-**MiniOneRec reproduction and analysis on a single RTX 4090, with training-correctness fixes, GRPO efficiency optimization, traditional recommender baselines, and controlled Semantic-ID intervention experiments.**
+**MiniOneRec — generative recommendation reproduction, Semantic-ID intervention analysis, and single-GPU training/inference optimization. All on one RTX 4090.**
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![License](https://img.shields.io/badge/License-Apache--2.0-green.svg)
@@ -40,7 +40,35 @@ to a prediction artifact. Negative results are kept and explained rather than dr
 
 ---
 
-## 2. Key Results
+## 2. Main Results
+
+Formal protocol, test split, `K = [1, 3, 5, 10, 20]`, single seed. Rows 1-8 are scored on
+the clean split; the shuffled rows use the shuffled split because their target SIDs are the
+shuffled ones.
+
+| # | System | Regime | HR@20 | NDCG@20 |
+|---|---|---|---|---|
+| 1 | Compact SASRec (Protocol B) | item-level Top-20 to SID | 0.07147584 | 0.05156672 |
+| 2 | **Clean SFT** | beam 20, constrained SID | **0.19832341** | **0.11786798** |
+| 3 | GRPO 0.25 ep, original | beam 20, constrained SID | 0.17626296 | 0.10885475 |
+| 4 | GRPO 0.25 ep, optimized | beam 20, constrained SID | 0.17538054 | 0.10824989 |
+| 5 | GRPO 1.5 ep | beam 20, constrained SID | 0.16170307 | 0.10470676 |
+| 6 | GRPO 2.0 ep | beam 20, constrained SID | 0.16236488 | 0.10447064 |
+| 7 | Shuffled Full SFT | beam 20, constrained SID | 0.10765497 | 0.08157358 |
+| 8 | Seq-only Clean | beam 20, constrained SID | 0.17802780 | 0.10842814 |
+| 9 | Seq-only Shuffled | beam 20, constrained SID | 0.10125745 | 0.07683363 |
+
+Row 1 shares only the **SID-level Top-K metric** with the generative rows: its candidate
+generation and scoring mechanism differ fundamentally (no beam search, no length penalty,
+no constrained SID decoding), and it is a 4-config sweep rather than a tuned baseline. Clean
+SFT reaches 2.7747x its HR@20. See [Caveats](#14-caveats).
+
+Inference cost for these operating points is in
+[Inference Benchmark](#9-inference-benchmark).
+
+---
+
+## 3. Key Results
 
 ### ① Training correctness — the reward was bound to the wrong thing
 
@@ -71,7 +99,7 @@ Clean SFT reaches **≈ 2.77×** the HR@20 of this compact SASRec
 > catalogue with a dot product and then maps items to SIDs. SASRec here is a compact
 > 4-config sweep, not a tuned baseline, and the SFT arm additionally trains SID↔title /
 > SID↔description alignment objectives that SASRec has no counterpart for — an
-> **uncontrolled** variable. See [Caveats](#10-caveats).
+> **uncontrolled** variable. See [Caveats](#14-caveats).
 
 ### ③ GRPO training efficiency
 
@@ -105,9 +133,40 @@ The intervention holds the **SID codebook, token vocabulary, trie topology, coll
 structure, popularity strata and SFT recipe** essentially fixed, changing only which item
 owns which SID. Absolute ΔHR@20 = **−0.09066844**, ΔNDCG@20 = **−0.03629440**.
 
+### (5) Sequence-only SID ablation
+
+The same shuffled-SID intervention, but with the two explicit text-auxiliary supervision
+tasks removed: only `SidSFTDataset` (history SID -> target SID) is kept, while
+`SidItemFeatDataset` and `FusionSeqRecDataset` are not instantiated. What is removed is the
+**explicit text auxiliary supervision**, not all textual semantics — the SIDs themselves are
+still produced by upstream text quantisation.
+
+| Model | HR@20 | NDCG@20 |
+|---|---|---|
+| Seq-only, clean | 17.803 % (`0.17802780`) | 10.843 % (`0.10842814`) |
+| Seq-only, shuffled | 10.126 % (`0.10125745`) | 7.683 % (`0.07683363`) |
+| **Relative change** | **−43.12 %** | **−29.14 %** |
+
+The shuffled-SID effect remains large without the auxiliary tasks, so the full-SFT
+intervention effect is not mainly dependent on those supervision paths. See
+[Semantic ID Analysis](#8-semantic-id-analysis) for the side-by-side comparison.
+
+### (6) Inference quality–latency benchmark
+
+Zero-shot cost of the *same* protocol at different beam widths and batch sizes, measured
+with the repository's own `evaluate.py` (see [Inference Benchmark](#9-inference-benchmark)).
+
+| Operating point | HR@20 | throughput | P50 latency | peak VRAM |
+|---|---|---|---|---|
+| beam 20, batch 8 (**balanced default**) | 0.19832341 | 27.49 samples/s | 300.17 ms | 2.03 GB |
+| beam 50, batch 8 | 0.19942643 | 12.60 samples/s | 649.25 ms | 3.68 GB |
+
+Doubling the beam buys **+0.0011 HR@20 absolute (+0.11 pp)** for **−54 % throughput** and
+**1.81× VRAM**.
+
 ---
 
-## 3. What I Changed
+## 4. What I Changed
 
 ### Training-correctness fixes
 
@@ -137,7 +196,7 @@ owns which SID. Absolute ΔHR@20 = **−0.09066844**, ΔNDCG@20 = **−0.0362944
 - `calc.py` accumulates NDCG with the **natural** logarithm and converts to the log2
   scale only at print time, so the intermediate accumulator is not the reported metric.
   Taking it at face value overstates NDCG substantially. Exact figures in the
-  [detailed record](notes/experiment_summary.md#144-method-notes-worth-keeping).
+  [detailed record](notes/experiment_summary.md#194-method-notes-worth-keeping).
 - The `length_penalty` reaching `model.generate()` is the CLI value (**0**); an inner
   helper's `1.0` default is dead code.
 - A "prefix-pair retention = 100 %" metric was **wrong** (it measured group-size
@@ -145,7 +204,7 @@ owns which SID. Absolute ΔHR@20 = **−0.09066844**, ΔNDCG@20 = **−0.0362944
 
 ---
 
-## 4. Experimental Pipeline
+## 5. Experimental Pipeline
 
 ```
    Amazon Industrial_and_Scientific  (3 686 items / 3 670 unique SIDs)
@@ -189,7 +248,7 @@ exactly 20 unique candidates per sample.
 
 ---
 
-## 5. Semantic-ID Controlled Intervention
+## 6. Semantic-ID Controlled Intervention
 
 ### Design
 
@@ -243,13 +302,17 @@ identity, titles and descriptions, sequence lengths, and the SFT recipe.
 
 This is **controlled-intervention evidence on the complete MiniOneRec SFT recipe**. The
 experiment supports that **semantic SID assignment contributes substantially to the full
-MiniOneRec SFT recipe, end to end**. It does **not** isolate the sequence-only semantic
-pathway, and it does **not** show that Semantic ID is the sole cause. See
-[Caveats](#10-caveats) for exactly what the design does and does not control.
+MiniOneRec SFT recipe, end to end.** A separate sequence-only ablation (see
+[Semantic ID Analysis](#8-semantic-id-analysis)) removes the two explicit text
+auxiliary supervision tasks and finds the shuffled-SID effect remains large
+(-43.12 % HR@20, -29.14 % NDCG@20 relative), so this effect is not mainly carried by
+those auxiliary paths. Neither experiment **proves** that Semantic ID is the sole
+cause. See
+[Caveats](#14-caveats) for exactly what the design does and does not control.
 
 ---
 
-## 6. GRPO Training Efficiency
+## 7. GRPO Training Efficiency
 
 **What was removed**
 
@@ -275,7 +338,84 @@ Quality is **approximately preserved**. Single seed, so no variance estimate is 
 
 ---
 
-## 7. Baselines & Evaluation
+## 8. Semantic ID Analysis
+
+Controlled intervention evidence on the **item↔SID assignment**. The treatment changes only
+which item owns which Semantic ID; the SID codebook and set, the token vocabulary, the trie
+prefix structure at every depth, the resulting allowed-token decoding masks, the popularity
+stratification, item/user identity, sequence lengths and the SFT recipe are all held fixed.
+The 31 collision items are frozen and carry no treatment.
+
+| Arm | HR@20 clean → shuffled | relative Δ | NDCG@20 clean → shuffled | relative Δ |
+|---|---|---|---|---|
+| Full SFT | 0.19832341 → 0.10765497 | **−45.72 %** | 0.11786798 → 0.08157358 | **−30.79 %** |
+| Sequence-only | 0.17802780 → 0.10125745 | **−43.12 %** | 0.10842814 → 0.07683363 | **−29.14 %** |
+
+This is **controlled intervention evidence**, not proof of a causal semantic hierarchy. The
+two arms also differ in training-set composition (79 834 vs 36 259 samples), so the seq-only
+comparison is not a single-variable isolation. See [Caveats](#14-caveats).
+
+---
+
+## 9. Inference Benchmark
+
+Formal protocol, unmodified `calc.py`, ORIGINAL INFO constrained decoding. The benchmark
+imports the repository's own `evaluate.py`, so it cannot drift from the formal
+recommendation protocol.
+
+**Quality sweep** — 4 533 test rows, batch 8:
+
+| beam | HR@20 | NDCG@20 | throughput | P50 | P95 | peak VRAM |
+|---|---|---|---|---|---|---|
+| 5 | — | — | 61.35 samples/s | 130.85 ms | 135.73 ms | 1.21 GB |
+| 10 | — | — | 45.37 samples/s | 178.49 ms | 184.46 ms | 1.48 GB |
+| **20** | **0.19832341** | **0.11786798** | 27.49 samples/s | 300.17 ms | 308.54 ms | 2.03 GB |
+| 50 | 0.19942643 | 0.11818527 | 12.60 samples/s | 649.25 ms | 668.67 ms | 3.68 GB |
+
+A beam-k run emits only k candidates, so beam 5 and beam 10 cannot report @20. Those cells
+are **deliberately em-dashed, not zero**. The beam-20 / batch-8 cell reproduces the formal
+clean-SFT reference exactly (`reference_match = True`).
+
+**Efficiency sweep** — beam 20, fixed first-512 workload:
+
+| batch | throughput | batch P50 | batch P95 | peak VRAM | peak device used |
+|---|---|---|---|---|---|
+| 1 | 11.53 samples/s | 85.63 ms | 90.66 ms | 1.07 GB | 5.53 GB |
+| **8** | 27.28 samples/s | 300.14 ms | 305.54 ms | 2.03 GB | 5.53 GB |
+| 32 | 30.33 samples/s | 1 041.73 ms | 1 049.10 ms | 5.34 GB | 6.99 GB |
+
+For batch 1 the single-request latency is that same measurement
+(P50 85.63 ms / P95 90.66 ms). `peak VRAM` is PyTorch peak *allocated* memory over the
+measured generation window; `peak device used` is a separately named device-level proxy that
+includes the CUDA context — they are not the same quantity.
+
+### Balanced operating point
+
+**`beam = 20, batch = 8`.**
+
+- Raising the beam to 50 costs **−54 % throughput** and **1.81× VRAM** for a marginal
+  Top-20 gain (**+0.11 pp** HR@20).
+- Raising the batch to 32 gains only **+11 % throughput** for **3.47× batch latency** and
+  **2.63× peak VRAM**.
+
+---
+
+## 10. Reproducibility & Engineering
+
+| Practice | What it means here |
+|---|---|
+| **Fail-loud preflight** | Every formal stage has a static preflight that refuses to start on any inconsistency, instead of proceeding and producing unattributable numbers. |
+| **Stable sample IDs** | The RL reward is bound to `sample_id` (namespaced by task and split) with fail-loud validation, not to prompt text — the bug that made upstream RL results unattributable. |
+| **Shared prompts** | One prompt construction path across arms, so clean vs. intervention differ only in the intervention variable. |
+| **Artifact hashing** | Every headline number traces to a prediction artifact with a recorded SHA256; archives are hash-verified on both server and workstation. |
+| **Byte-identical reference reproduction** | The restored formal checkpoint regenerates the historical beam-20 prediction artifact byte for byte (identical SHA256). |
+| **Portable launchers** | Entrypoints resolve paths from their own location, so they run from any working directory and on any checkout. |
+| **Atomic benchmark results** | Results are written per configuration via temp-file + `fsync` + `os.replace`, so a later failure cannot lose earlier configurations. |
+| **No second protocol** | The benchmark imports the repository's `evaluate.py`; an AST guard asserts the protocol classes are not re-implemented. |
+
+---
+
+## 11. Baselines & Evaluation
 
 ### Formal evaluation protocol
 
@@ -312,7 +452,7 @@ branch-size control are in [the detailed experiment record](notes/experiment_sum
 
 ---
 
-## 8. Reproduction
+## 12. Reproduction
 
 ### Environment
 
@@ -372,7 +512,7 @@ embeddings) is unchanged and documented under
 
 ---
 
-## 9. Repository Structure
+## 13. Repository Structure
 
 ```
 ├── README.md                        this file
@@ -405,7 +545,7 @@ embeddings) is unchanged and documented under
 
 ---
 
-## 10. Caveats
+## 14. Caveats
 
 **Scope of the intervention claim.** The **controlled intervention variable is the
 item↔SID assignment.** Everything the constrained decoder depends on is held fixed: the
@@ -422,10 +562,11 @@ auxiliary supervision is **deterministically remapped together with the SID assi
 because that supervision is derived from the same index.
 
 So the experiment supports: **semantic SID assignment contributes substantially to the
-full MiniOneRec SFT recipe, end to end.** It does **not** isolate the sequence-only
-semantic pathway, because the metadata↔SID auxiliary heads were retrained under the same
-remapped supervision and cannot be separated from it by this design. It does **not** prove
-that Semantic ID is the sole cause.
+full MiniOneRec SFT recipe, end to end.** A separate sequence-only ablation
+(see [Semantic ID Analysis](#8-semantic-id-analysis)) removes the two explicit text
+auxiliary supervision tasks and finds the shuffled-SID effect remains large
+(−43.12 % HR@20, −29.14 % NDCG@20 relative), so this effect is not mainly carried by those
+auxiliary paths. Neither experiment **proves** that Semantic ID is the sole cause.
 
 **The 31 frozen collision items carry no treatment.** They are retained in train, valid
 and test and are evaluated normally, but their item↔SID assignment was intentionally not
@@ -457,9 +598,23 @@ used as the full training loss.
 **Observational analyses are correlational.** Popularity and prefix-affinity findings carry
 no causal claim; the matched branch-size control narrows but does not eliminate confounding.
 
+**The seq-only arm is not a single-variable isolation.** It removes the explicit text
+auxiliary supervision, but it also trains on far fewer samples (36 259 vs 79 834), so the
+full-vs-seq-only comparison changes more than one thing. It also does **not** remove text
+from the system: the Semantic IDs remain text-quantised upstream.
+
+**Batch-dependent prediction divergence was observed** in the inference benchmark, while
+aggregate HR/NDCG remained nearly stable (batch 1 vs 8: 0.78 % exact prediction match;
+batch 1 vs 32: 0.98 %; subset HR@20 identical at 0.18359375 across all three). No root cause
+is claimed — this is recorded as an observation, not attributed to floating-point
+non-determinism.
+
+**Backbone scale.** Qwen2.5-0.5B is the current main backbone; no larger-backbone result is
+reported here.
+
 ---
 
-## 11. Detailed Experiment Record
+## 15. Detailed Experiment Record
 
 📊 **[`notes/experiment_summary.md`](notes/experiment_summary.md)** is the **single
 authoritative record** for every number on this page.
@@ -479,12 +634,24 @@ It contains, in full:
 11. **Final comparison table** — all 7 systems
 12. **Failure diagnostics** — zero-advantage ratio, KL heavy tail
 13. **Provenance and caveats** — including corrections of superseded conclusions
-14. **Reproducibility artifacts**
+14. **Sequence-only SID ablation** — clean vs. shuffled, and the full-SFT comparison
+15. **Reference reproduction** — restored checkpoint under the formal protocol
+16. **Inference quality–latency benchmark** — protocol identity, quality and efficiency sweeps
+17. **Batch-invariance caveat**
+18. **Final artifact provenance** — archives, hashes, benchmark method notes
+19. **Reproducibility artifacts**
 
 Every headline number there is traceable to a prediction artifact and was re-derived by
 machine from it. Superseded conclusions (an earlier `--info_file` claim, an earlier
 pair-retention definition, a mislabelled checkpoint) are corrected **in place** rather
 than silently removed.
+---
+
+## 16. Next Step
+
+> Next: backbone-scaling sanity check with Qwen2.5-1.5B under the same Clean vs.
+> shuffled-SID protocol.
+
 ---
 
 # 🧩 Upstream framework & attribution
@@ -495,7 +662,7 @@ providing an end-to-end workflow spanning **SID construction**, **supervised fin
 
 > **This repository is an independent reproduction and analysis of MiniOneRec, not the
 > upstream project.** All upstream code is used unmodified except where listed in
-> [§3 What I Changed](#3-what-i-changed). The upstream framework documentation, SID
+> [§3 What I Changed](#4-what-i-changed). The upstream framework documentation, SID
 > construction recipes and full pipeline walk-through live in the upstream repository
 > linked below and are not duplicated here.
 
