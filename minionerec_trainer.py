@@ -47,6 +47,8 @@ from trl import apply_chat_template, is_conversational, maybe_apply_chat_templat
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl import SyncRefModelCallback
 from trl import GRPOConfig
+
+from sid_utils import infer_prefix_index  # single source of truth for SID depth
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
 
 import random
@@ -545,10 +547,9 @@ class ReReTrainer(Trainer):
         else:
             prefixID = [tokenizer(_).input_ids for _ in info]
         
-        if self.base_model.lower().find("gpt2") > -1:
-            prefix_index = 4
-        else:
-            prefix_index = 3
+        # [Stage 2.5] Derive prefix_index from the catalogue instead of the
+        # hardcoded gpt2/else constant, so any SID depth works.
+        prefix_index, _sid_depth, _wrapper_len = infer_prefix_index(info, tokenizer)
             
         self.hash_dict = dict()
         # sasrec_dict = dict()

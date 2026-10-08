@@ -724,9 +724,14 @@ class SidItemFeatDataset(JSONBaseDataset):
         for item_id, sids in self.indices.items():
             if item_id in self.item_feat:
                 title = self.item_feat[item_id]['title']
-                # Concatenate all three semantic IDs as the key
+                # [Stage 3] Concatenate ALL SID levels instead of a hardcoded 3.
+                # Identity for the P0 3-level catalogue (its SID lists have exactly
+                # 3 entries) but keeps a deeper SID -- e.g. LETTER's 4-level
+                # <a><b><c><d> -- intact. The old sids[0]+sids[1]+sids[2] silently
+                # dropped the 4th level, so this dataset never saw <d_*> tokens and
+                # disagreed with every other dataset's SID format.
                 if len(sids) >= 3:
-                    combined_sid = sids[0] + sids[1] + sids[2]
+                    combined_sid = ''.join(sids)
                     self.sid2title[combined_sid] = title
                     self.title2sid[title] = combined_sid
         

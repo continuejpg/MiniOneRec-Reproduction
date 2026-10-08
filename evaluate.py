@@ -7,8 +7,10 @@ import os
 from transformers import GenerationConfig,  AutoTokenizer, BitsAndBytesConfig, AutoModelForCausalLM, LogitsProcessorList, TemperatureLogitsWarper
 from data import  EvalD3Dataset, EvalSidDataset
 from LogitProcessor import ConstrainedLogitsProcessor
+from sid_utils import infer_prefix_index  # single source of truth for SID depth
 from accelerate import Accelerator
 import random
+import re
 import time
 import bitsandbytes as bnb
 
@@ -73,6 +75,16 @@ def main(
 
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
+    # [Stage 2.5] Register the catalogue's own SID tokens before the trie is
+    # built, mirroring sft.py at training time (TokenExtender -> add_tokens).
+    # Without this a SID from another catalogue/depth (LETTER's '<a_48>') is
+    # split into subword pieces and the constrained-decoding trie is useless.
+    _catalogue_tokens = sorted({t for s in semantic_ids
+                                for t in re.findall(r"<[^<>]+>", s)})
+    if _catalogue_tokens:
+        _n_added = tokenizer.add_tokens(_catalogue_tokens)
+        print(f"[evaluate] registered {_n_added} SID tokens; "
+              f"tokenizer len = {len(tokenizer)}")
     
     # Create prefixID for semantic IDs (existing functionality)
     if base_model.lower().find("llama") > -1:
@@ -81,10 +93,12 @@ def main(
     else:
         prefixID = [tokenizer(_).input_ids for _ in info_semantic]
         prefixTitleID = [tokenizer(_).input_ids for _ in info_titles]
-    if base_model.lower().find("gpt2") > -1:
-        prefix_index = 4
-    else:
-        prefix_index = 3
+    # [Stage 2.5] Was hardcoded (4 for gpt2 else 3), which silently truncated
+    # any SID deeper than 3. Derive it from the catalogue instead.
+    prefix_index, sid_depth, _wrapper_len = infer_prefix_index(
+        info_semantic, tokenizer)
+    print(f"[evaluate] inferred SID depth = {sid_depth}, "
+          f"prefix_index = {prefix_index}")
     
     # Build hash_dict for semantic IDs (existing functionality)
     hash_dict = dict()
@@ -188,7 +202,8 @@ def main(
                 prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
                 num_beams=num_beams,
                 base_model=base_model,
-                eos_token_id=model.config.eos_token_id
+                eos_token_id=model.config.eos_token_id,
+                prefix_index=prefix_index,
             )
             logits_processor = LogitsProcessorList([clp])
 
