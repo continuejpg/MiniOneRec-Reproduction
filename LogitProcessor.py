@@ -8,6 +8,8 @@ import warnings
 
 from transformers.utils import add_start_docstrings
 
+from sid_utils import infer_prefix_index  # single source of truth for SID depth
+
 LOGITS_PROCESSOR_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
@@ -28,14 +30,21 @@ class ConstrainedLogitsProcessor(LogitsProcessor):
         prefix_allowed_tokens_fn: Callable[[int, torch.Tensor], List[int]],
         num_beams: int,
         base_model: str = None,
-        eos_token_id: int = None
+        eos_token_id: int = None,
+        prefix_index: int = None
     ):
         self._prefix_allowed_tokens_fn = prefix_allowed_tokens_fn
         self._num_beams = num_beams
         self.count=0
         self.base_model = base_model
         self.eos_token_id = eos_token_id
-        if self.base_model.lower().find("gpt2") > -1:
+        # [Stage 2.5] The SID-depth assumption is no longer hardcoded. Callers
+        # that know the catalogue pass prefix_index explicitly (derived by
+        # sid_utils.infer_prefix_index). When omitted we keep the legacy
+        # gpt2 rule so that any out-of-tree caller keeps its old behaviour.
+        if prefix_index is not None:
+            self.prefix_index = int(prefix_index)
+        elif self.base_model is not None and self.base_model.lower().find("gpt2") > -1:
             self.prefix_index = 4
         else:
             self.prefix_index = 3
