@@ -24,3 +24,11 @@ data/Amazon/info/*_shuffled.info.txt
 .env
 .env.*
 !.env.example
+
+# ---------------------------------------------------------------------------
+# LETTER-SID work (Stage 1/2). Binary artifacts and training runs are NOT
+# tracked: they are large, machine-produced, and reproducible from the scripts
+# under tools/letter_stage1/ and rq/letter/. Only the *scripts* are versioned.
+# ---------------------------------------------------------------------------
+artifacts/
+runs/
