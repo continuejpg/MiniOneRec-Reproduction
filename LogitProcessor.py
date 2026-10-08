@@ -31,11 +31,22 @@ class ConstrainedLogitsProcessor(LogitsProcessor):
         num_beams: int,
         base_model: str = None,
         eos_token_id: int = None,
-        prefix_index: int = None
+        prefix_index: int = None,
+        count_0: int = 0
     ):
         self._prefix_allowed_tokens_fn = prefix_allowed_tokens_fn
         self._num_beams = num_beams
-        self.count=0
+        # [R2.1] `count_0` = number of SID tokens the prompt already ends with
+        # (0 for the NORMAL route, h for a hinted HARD route). The decoder uses
+        # `sent[-count:]` as the trie hash key, and on its first call falls back
+        # to the fixed window `sent[-prefix_index:]`. If the prompt ends with
+        # hinted SID tokens, that window slides onto them and yields a key the
+        # trie does not contain, so `prefix_allowed_tokens_fn` returns [] and the
+        # processor forces EOS (measured in the R2.0 probe: h=1 -> 0 legal
+        # candidates). Counting the hinted tokens as already-generated keeps
+        # every subsequent key aligned with the trie.
+        # Default 0 reproduces the original behaviour exactly.
+        self.count = int(count_0)
         self.base_model = base_model
         self.eos_token_id = eos_token_id
         # [Stage 2.5] The SID-depth assumption is no longer hardcoded. Callers

@@ -677,6 +677,45 @@ pair-retention definition, a mislabelled checkpoint) are corrected **in place** 
 than silently removed.
 ---
 
+## 15b. RL Post-training Extension (R1 / R2)
+
+Two RL reward designs were tried after the GRPO benchmark above. **Both are negative
+results and are documented in full** in
+[`docs/rl_posttraining_results.md`](docs/rl_posttraining_results.md).
+
+| experiment | change | outcome |
+|---|---|---|
+| **R1** ReRe-style rank reward | replaced the `ranking` reward with ReRe Eq.7-9 (rank-aware, normalised per group) | `zero_advantage_group_ratio` fell to **0.0** on every step, yet test HR@20 fell to **0.05912199** and the output distribution collapsed (**99** distinct top-1 predictions, most-common share 33.6 %). |
+| **R2** reachability-guided GRPO | exact-match 0/1 reward + a route cache that puts the first GT SID token in the prompt for samples the frozen SFT could not reach (h=1); supervised prefix CE (coef 0.1) keeps the hinted level trained | `zero_advantage_group_ratio` improved to **0.4750** (from ~0.70), yet validation HR@20 fell to **0.15600177** vs SFT **0.18314210** and old GRPO **0.17122683**. |
+
+**Conclusion: neither method beats the clean SFT baseline. SFT remains the best model.**
+Reducing the zero-advantage group ratio was **not** the bottleneck - old GRPO carried
+~70 % zero-advantage groups and still outscored R2.
+
+> **Mechanism notes are hypotheses, not proven causes.** R1's collapse is *consistent
+> with* ReRe Eq.9's within-group normalisation rewarding preservation of the frozen
+> policy's own ordering, but no control run isolates it. R2 changed the reward **and**
+> the prompt routing at once and has **no ablation separating them**, so the cause of
+> its regression is **UNKNOWN**. All runs are single-seed.
+
+### R2 infrastructure worth reusing
+
+- `LogitProcessor.py` gained an optional **`count_0`** parameter. Its first trie key was
+  hardcoded to `sent[-3:]`, which slides onto a hinted prefix and forces EOS; counting the
+  hinted tokens as already-generated fixes it. **Default 0 leaves the NORMAL path
+  bit-for-bit unchanged.**
+- `rl_router.py` builds an offline route cache from the frozen SFT's h=0 rollout over the
+  **train split only** (17,516 entries, 4,818 NORMAL / 12,698 HARD). In formal mode `rl.py`
+  **aborts** if the cache does not cover every training `sample_id`; it will not silently
+  shrink the training set.
+- New pure-function modules: `rere_reward.py`, `rl_reward.py`, `rl_prefix_ce.py`.
+- New launchers: `patches/grpo_rere_rank025.sh`, `patches/grpo_r21.sh`,
+  `patches/eval_grpo_r21_valid.sh`.
+
+These are marked **experimental** and are **not** wired to any default configuration.
+
+---
+
 ## 16. Next Step
 
 The Qwen2.5-1.5B backbone-scaling sanity check described in

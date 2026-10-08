@@ -1,5 +1,10 @@
 from datasets import Dataset
 from trl import GRPOConfig, GRPOTrainer
+
+# [R2.1b] reachability-guided dual-route helpers
+import rl_reward
+
+import rere_reward
 import random
 import numpy as np
 import torch
@@ -59,6 +64,8 @@ def train(
     sync_ref_model: bool = False,
     test_beam: int = 20,
     reward_type: str = "rule",
+    route_cache: str = "",      # [R2.1b] offline reachability route cache
+    r21_enable: bool = False,   # [R2.1b] enable the dual-route path
     sample_train: bool = False,
     ada_path: str = "",
     cf_path: str = "",
@@ -152,6 +159,103 @@ def train(
 
     train_dataset = Dataset.from_dict({k : [elm[k] for elm in train_data] for k in train_data[0].keys()})
     train_dataset = train_dataset.shuffle(seed=seed) 
+
+    # ------------------------------------------------------------------
+    # [R2.1b] reachability routing.
+    # Route cache is built OFFLINE from the frozen SFT h=0 rollout, train split
+    # only, keyed by stable `sample_id`, so the shuffle above cannot mis-align it.
+    # HARD samples get the first GT SID token appended right after the
+    # "### Response:" marker -- the answer slot -- so the hinted tokens live in
+    # prompt_ids and completion_ids holds only the sampled suffix.
+    # ------------------------------------------------------------------
+    id2hint = {}
+    route_of = {}
+    if r21_enable:
+        if not route_cache or not os.path.exists(route_cache):
+            raise FileNotFoundError(
+                f"[R2.1b] --r21_enable requires --route_cache; not found: {route_cache!r}")
+        _cache = json.load(open(route_cache, encoding="utf-8"))
+        _routes = _cache["routes"]
+        print(f"[R2.1b] route cache : {route_cache}")
+        print(f"[R2.1b]   meta      : {_cache.get('meta')}")
+        # [R2.1g] Formal mode is STRICT: the cache must cover every training
+        # sample. A partial cache must abort the run, never silently degrade the
+        # training set. Only an explicitly-requested smoke may narrow the scope.
+        _smoke_ids = os.environ.get("R21_SMOKE_IDS", "")
+        _smoke_any = (_smoke_ids
+                      or int(os.environ.get("R21_SMOKE_LIMIT", "0") or 0) > 0)
+        if _smoke_any:
+            _cached = [i for i in range(len(train_dataset))
+                       if train_dataset[i]["sample_id"] in _routes]
+            if not _cached:
+                raise KeyError(
+                    "[R2.1b] route cache shares no sample_id with the dataset; "
+                    "cache and dataset came from different sources")
+            if len(_cached) < len(train_dataset):
+                print(f"[R2.1b] SMOKE mode: cache covers {len(_cached)}/"
+                      f"{len(train_dataset)} dataset samples; restricting the run")
+                train_dataset = train_dataset.select(_cached)
+        else:
+            _ds_ids = set(train_dataset["sample_id"])
+            _missing = _ds_ids - set(_routes.keys())
+            if _missing:
+                raise KeyError(
+                    f"[R2.1g] route cache is INCOMPLETE: {len(_missing)} of "
+                    f"{len(_ds_ids)} training sample_ids have no route entry, "
+                    f"e.g. {sorted(_missing)[:3]}. Formal training refuses to "
+                    f"silently drop data. Rebuild the cache over the full "
+                    f"training set (rl_router.py --out splits/r21_route_cache.json).")
+            _extra = set(_routes.keys()) - _ds_ids
+            print(f"[R2.1g] cache coverage : {len(_ds_ids)}/{len(_ds_ids)} "
+                  f"dataset sample_ids covered"
+                  + (f"  ({len(_extra)} unused cache entries)" if _extra else ""))
+        _bad = []
+        for _i in range(len(train_dataset)):
+            _sid = train_dataset[_i]["sample_id"]
+            _r = _routes.get(_sid)
+            if _r is None:
+                raise KeyError(f"[R2.1b] sample_id {_sid!r} has no route entry")
+            _rt, _hint = _r["route"], _r.get("hint", "")
+            if _rt == "HARD":
+                if not _hint or not _hint.startswith("<"):
+                    _bad.append((_sid, _hint))
+            elif _rt != "NORMAL":
+                _bad.append((_sid, _rt))
+            id2hint[_sid] = _hint if _rt == "HARD" else ""
+            route_of[_sid] = _rt
+        if _bad:
+            raise ValueError(f"[R2.1b] malformed cache entries: {_bad[:3]}")
+        _nn = sum(1 for v in route_of.values() if v == "NORMAL")
+        _nh = sum(1 for v in route_of.values() if v == "HARD")
+        print(f"[R2.1b] routed      : NORMAL={_nn}  HARD={_nh}  total={len(route_of)}")
+        _prompts = list(train_dataset["prompt"])
+        _sids = list(train_dataset["sample_id"])
+        _ch = 0
+        for _i, _sid in enumerate(_sids):
+            _h = id2hint.get(_sid, "")
+            if _h:
+                _prompts[_i] = _prompts[_i] + _h
+                _ch += 1
+        train_dataset = train_dataset.remove_columns(["prompt"])
+        train_dataset = train_dataset.add_column("prompt", _prompts)
+        print(f"[R2.1b] prompts     : {_ch} got a GT hint appended")
+        # [R2.1f] smoke-only explicit sample selection; inert unless
+        # R21_SMOKE_IDS is set. Lets the acceptance smoke drive exactly one
+        # sample per (task_type, route) cell through the real entry point.
+        _want_ids = os.environ.get("R21_SMOKE_IDS", "")
+        if _want_ids:
+            _wset = set(_want_ids.split(","))
+            _idx = [i for i in range(len(train_dataset))
+                    if train_dataset[i]["sample_id"] in _wset]
+            print(f"[R2.1f] SMOKE      : selecting {len(_idx)}/{len(train_dataset)} "
+                  f"explicit sample_ids")
+            train_dataset = train_dataset.select(_idx)
+        # [R2.1c] smoke-only truncation; inert unless R21_SMOKE_LIMIT is set so
+        # the formal run is unaffected.
+        _smoke = int(os.environ.get("R21_SMOKE_LIMIT", "0") or 0)
+        if _smoke > 0:
+            train_dataset = train_dataset.select(range(min(_smoke, len(train_dataset))))
+            print(f"[R2.1c] SMOKE      : dataset truncated to {len(train_dataset)} samples")
     if sample_train and "sft" in model_path:
         train_dataset = train_dataset.select(range(int(0.2 * len(train_dataset)), len(train_dataset)))
     eval_dataset = Dataset.from_dict({k : [elm[k] for elm in eval_data] for k in eval_data[0].keys()})
@@ -323,6 +427,48 @@ def train(
                 rewards.append(0.0)
         return rewards
 
+    # ------------------------------------------------------------------
+    # ReRe ranking reward (Eq.7-9). Group-wise, per prompt.
+    #
+    # Eq.7  R_rule      : +1 for the ground-truth item, 0 for every other item
+    # Eq.8  R_hat_rank  :  0            for the ground-truth item
+    #                     -1/log(r + 2) for a NON-ground-truth item at zero-based
+    #                     rank r. r is the position inside the group, which the
+    #                     BEAM_SAMPLE rollout already returns sorted by sequence
+    #                     score descending (verified empirically), so rho = r + 1
+    #                     and no extra ranking step is needed.
+    # Eq.9  R_rank      : -R_hat_rank_i / sum_j R_hat_rank_j, normalised over the
+    #                     CURRENT GROUP. The ground-truth entry contributes 0 to
+    #                     the denominator, so its R_rank is 0 by construction.
+    #                     Normalising a fixed G-entry weight vector and then
+    #                     zeroing the GT slot would use a different denominator
+    #                     whenever the GT is present -- which Eq.9 forbids.
+    #
+    # The arithmetic lives in rere_reward.py so it can be unit-tested with no
+    # model, tokenizer, GPU or trl import.
+    # ------------------------------------------------------------------
+    def rere_rank_reward(prompts, completions, sample_id=None, **kwargs):
+        """Group-wise ReRe ranking reward. One call per training step.
+
+        `completions` arrives as B*G entries, G consecutive entries per prompt
+        (TRL repeats each sample `num_generations` times), so group boundaries are
+        taken at multiples of G -- exactly as the upstream rewards do.
+        """
+        targets = _resolve_targets(sample_id, completions)
+        n = len(completions)
+        G = num_generations
+        if n % G != 0:
+            raise ValueError(
+                f"rere_rank_reward: {n} completions is not a multiple of "
+                f"num_generations={G}; cannot form prompt groups")
+        flags_per_group = []
+        for start in range(0, n, G):
+            tgt = targets[start].strip("\n\" ")
+            flags_per_group.append(
+                [c.strip("\n\" ") == tgt for c in completions[start:start + G]])
+        totals, _rules, _ranks = rere_reward.group_flatten(flags_per_group)
+        return totals
+
     def semantic_reward(prompts, completions, sample_id=None, **kwargs):
         targets = _resolve_targets(sample_id, completions)
         target_ids = [item2id[elm.strip("\"\n")] for elm in targets]
@@ -379,6 +525,41 @@ def train(
         reward_fun = [rule_reward, ndcg_rule_reward]
     elif reward_type == "ranking_only":
         reward_fun = ndcg_rule_reward
+    elif reward_type == "rere_rank":
+        reward_fun = rere_rank_reward
+    elif reward_type == "r21_exact":
+        # [R2.1b] exact-match 0/1 full-SID reward for the dual route.
+        # NORMAL compares the completion directly; HARD reconstructs
+        # hint + sampled suffix before comparing. No ranking reward.
+        if not r21_enable:
+            raise ValueError(
+                "--reward_type r21_exact requires --r21_enable and a "
+                "--route_cache built by rl_router.py")
+
+        def exact_match_reward(prompts, completions, sample_id=None, **kwargs):
+            targets = _resolve_targets(sample_id, completions)
+            # [R2.1f] read-only scratch for the acceptance driver: records the
+            # ground truths the Trainer itself used, so the driver can recompute
+            # the reward independently and compare. Nothing here alters values.
+            try:
+                _S = globals().setdefault("_R21_SCRATCH", {})
+                _S["sids"] = list(sample_id or [])
+                _S["targets"] = list(targets)
+                _S["completions"] = list(completions)
+                _S["prompts"] = list(prompts or [])
+            except Exception:
+                pass
+            hints = []
+            for sid in sample_id:
+                if sid not in id2hint:
+                    raise KeyError(
+                        f"[R2.1b] reward got sample_id {sid!r} with no route "
+                        f"binding; dataset and cache are out of sync")
+                hints.append(id2hint[sid])
+            comps = [c if isinstance(c, str) else str(c) for c in completions]
+            return rl_reward.exact_match_rewards(comps, targets, hints)
+
+        reward_fun = exact_match_reward
     elif reward_type == "semantic":
         reward_fun = semantic_reward
     elif reward_type == "sasrec":
@@ -387,7 +568,12 @@ def train(
     os.environ['WANDB_PROJECT'] = wandb_project
     os.environ["WANDB_MODE"] = "offline"
 
+    _smoke_steps = int(os.environ.get("R21_SMOKE_STEPS", "0") or 0)
+    if _smoke_steps > 0:
+        num_train_epochs = 1
+        print(f"[R2.1c] SMOKE      : capping to max_steps={_smoke_steps}")
     training_args = GRPOConfig(output_dir=output_dir,
+                                max_steps=(_smoke_steps if _smoke_steps > 0 else -1),
                                 save_steps=save_steps_frac,
                                 save_total_limit=2,
                                 eval_strategy="steps",

@@ -49,6 +49,7 @@ from trl import SyncRefModelCallback
 from trl import GRPOConfig
 
 from sid_utils import infer_prefix_index  # single source of truth for SID depth
+from rl_prefix_ce import prefix_ce_loss  # [R2.1] HARD-route prefix cross-entropy
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
 
 import random
@@ -378,6 +379,14 @@ class ReReTrainer(Trainer):
 
         self.add_gt = add_gt
         self.beam_search = beam_search
+        # [R2.1] SID token ids (the added vocabulary from TokenExtender) are the
+        # only tokens a prompt can legitimately end with on the HARD route, so
+        # the trailing count is derivable from token ids alone.
+        self._r21_sid_ids = set()
+        self._r21_hint_len_cache = 0
+        # [R2.1] coefficient of the HARD-route supervised prefix CE. Fixed by
+        # design; not swept in this phase.
+        self.prefix_ce_coef = 0.1
         self.info_file = info_file
         self.temperature = args.temperature
         self.length_penalty = length_penalty
@@ -568,6 +577,15 @@ class ReReTrainer(Trainer):
         for key in self.hash_dict.keys():
             self.hash_dict[key] = list(self.hash_dict[key])
 
+        # [R2.1] Every id that appears as an allowed continuation is a SID token,
+        # so their union is exactly the added SID vocabulary. Used by
+        # `_r21_count0` to detect trailing hinted tokens from ids alone.
+        _sid_ids = set()
+        for _v in self.hash_dict.values():
+            _sid_ids.update(_v)
+        _sid_ids.discard(tokenizer.eos_token_id)
+        self._r21_sid_ids = _sid_ids
+
         self.test_generation_config = GenerationConfig(max_new_tokens=self.max_completion_length,
                                                             length_penalty=self.length_penalty,
                                                             num_beams=self.test_beam,
@@ -581,6 +599,36 @@ class ReReTrainer(Trainer):
     def get_hash(self, x):
             x = [str(_) for _ in x]
             return '-'.join(x)
+
+    def _r21_count0(self, prompt_ids):
+        """[R2.1] How many SID tokens the prompt ends with (batch-level).
+
+        Returns 0 for the NORMAL route and h for a hinted HARD route. Asserts
+        that the count is uniform across the batch, because a batch mixing 0
+        and h would need per-sample constrained decoding (the logits processor
+        keeps a single scalar `count`).
+        """
+        if not self._r21_sid_ids or prompt_ids is None or prompt_ids.numel() == 0:
+            self._r21_hint_len_cache = 0
+            return 0
+        ids = prompt_ids.detach().to("cpu")
+        counts = []
+        for row in ids:
+            n = 0
+            for v in reversed(row.tolist()):
+                if v in self._r21_sid_ids:
+                    n += 1
+                else:
+                    break
+            counts.append(n)
+        uniq = sorted(set(counts))
+        if len(uniq) > 1:
+            raise ValueError(
+                f"[R2.1] mixed hint lengths in one batch: {uniq}. The logits "
+                f"processor carries a single `count`, so a batch must be either "
+                f"all-NORMAL (0) or all-HARD (h).")
+        self._r21_hint_len_cache = uniq[0] if uniq else 0
+        return self._r21_hint_len_cache
 
     def prefix_allowed_tokens_fn(self, batch_id, input_ids):
             hash_number = self.get_hash(input_ids)
@@ -690,7 +738,11 @@ class ReReTrainer(Trainer):
                 # unconditional_ids=None,
                 num_beams=self.num_generations if self.beam_search else 1,
                 base_model=self.base_model,
-                eos_token_id=self.processing_class.eos_token_id
+                eos_token_id=self.processing_class.eos_token_id,
+                # [R2.1] number of trailing SID tokens the prompt already ends
+                # with (0 = NORMAL route, h = hinted HARD route). Derived from
+                # the batch itself so the trainer needs no routing state.
+                count_0=self._r21_count0(prompt_ids),
             )
         self.logits_processor = LogitsProcessorList([TemperatureLogitsWarper(temperature=self.temperature), ccc])
         self.test_lp_list = LogitsProcessorList([ccc])
@@ -914,6 +966,40 @@ class ReReTrainer(Trainer):
                 completions.append([{"role": "assistant", "content": bootstrap + completion}])
         else:
             completions = completions_text
+
+        # ------------------------------------------------------------------
+        # [R2.1] HARD-route supervised prefix cross-entropy.
+        #
+        # The hinted tokens live in the PROMPT, so they never enter
+        # completion_ids and therefore never enter per_token_loss: they receive
+        # NO GRPO credit. To keep the hinted level learnable we add a plain
+        # supervised CE computed from the ORIGINAL prompt with the hint removed.
+        # That is an ordinary LM loss on the language-model head, so gradients
+        # flow into the shared backbone and the LM head, not into the policy
+        # ratio. Skipped entirely on the NORMAL route.
+        # ------------------------------------------------------------------
+        self._prefix_ce = None
+        self._prefix_ce_value = 0.0
+        _H = int(getattr(self, '_r21_hint_len_cache', 0) or 0)
+        if _H > 0:
+            _plen = prompt_ids.size(1) - _H
+            if _plen > 0:
+                with torch.no_grad():
+                    _orig_txt = self.processing_class.batch_decode(
+                        prompt_ids[:, :_plen], skip_special_tokens=True)
+                    _enc = self.processing_class(
+                        _orig_txt, return_tensors="pt", padding=True,
+                        padding_side="left", add_special_tokens=False)
+                    _orig_ids = super()._prepare_inputs(_enc)["input_ids"]
+                _hint_ids = prompt_ids[:, _plen:]
+                _cat = torch.cat([_orig_ids, _hint_ids], dim=1)
+                _attn = torch.ones_like(_cat)
+                _logits = self.model(input_ids=_cat, attention_mask=_attn).logits
+                _ce, _ = prefix_ce_loss(_logits, _orig_ids.size(1), _hint_ids)
+                self._prefix_ce = _ce
+                self._prefix_ce_value = float(_ce.detach())
+
+        div_lis = [len(set(completions_text[i:i+self.num_generations]))/self.num_generations for i in range(0, len(completions_text), self.num_generations)]
         
         div_lis = [len(set(completions_text[i:i+self.num_generations]))/self.num_generations for i in range(0, len(completions_text), self.num_generations)]
         # cate_diversity = len(set(completions_text))/len(completions_text)
@@ -1109,6 +1195,13 @@ class ReReTrainer(Trainer):
             loss = -(s_score*advantages - self.beta*sequence_kl).mean()
         else:
             loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+        # [R2.1] HARD-route prefix CE. Fixed coefficient, not swept. It is a
+        # supervised LM term over the hinted tokens, disjoint from the GRPO
+        # suffix term, so it cannot create or consume policy credit.
+        _pce = getattr(self, "_prefix_ce", None)
+        if _pce is not None:
+            loss = loss + self.prefix_ce_coef * _pce
         # Log the metrics
 
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()

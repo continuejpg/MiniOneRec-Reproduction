@@ -46,3 +46,9 @@ runs/
 # ---------------------------------------------------------------------------
 rq/letter/*
 !rq/letter/UPSTREAM_MANIFEST.json
+
+# [R2] offline route cache (1.5 MB generated artifact; rebuild with rl_router.py)
+splits/r21_route_cache.json
+
+# [R2] throwaway comparison launchers used during the R2.2 validation run
+patches/_tmp_eval_*.sh
