@@ -32,3 +32,17 @@ data/Amazon/info/*_shuffled.info.txt
 # ---------------------------------------------------------------------------
 artifacts/
 runs/
+
+# ---------------------------------------------------------------------------
+# Vendored upstream LETTER tokenizer sources.
+#
+# Deliberately NOT tracked: https://github.com/HonghuiBao2000/LETTER declares no
+# license (no LICENSE/COPYING/NOTICE file; GitHub reports license: None), so its
+# source may not be redistributed here. rq/letter/ is a locally fetched
+# dependency. Rebuild and hash-verify it with:
+#     python tools/fetch_letter_upstream.py
+# The per-file lineage (upstream sha256 + applied local edits) is tracked as
+# rq/letter/UPSTREAM_MANIFEST.json, which this negation keeps visible.
+# ---------------------------------------------------------------------------
+rq/letter/*
+!rq/letter/UPSTREAM_MANIFEST.json
